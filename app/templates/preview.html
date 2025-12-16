@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+
+{% block title %}Preview Claims{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>Preview Claims</h2>
+    <div>
+        <span class="badge bg-primary fs-6">{{ claims|length }} Claims</span>
+        <span class="badge bg-success fs-6">
+            {{ claims|sum(attribute='service_lines'|length) }} Line Items
+        </span>
+    </div>
+</div>
+
+<div class="alert alert-info">
+    <strong>File:</strong> {{ filename }}
+    <br>
+    <small>Review the parsed data below. Click "Submit to eBilling" when ready.</small>
+</div>
+
+<div class="table-responsive">
+    <table class="table table-striped table-hover">
+        <thead class="table-dark">
+            <tr>
+                <th>Patient</th>
+                <th>DOB</th>
+                <th>Date of Service</th>
+                <th>CPT Code</th>
+                <th>Units</th>
+                <th>Charges</th>
+                <th>Provider</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for claim in claims %}
+                {% for line in claim.service_lines %}
+                <tr>
+                    {% if loop.first %}
+                    <td rowspan="{{ claim.service_lines|length }}">
+                        <strong>{{ claim.patient_name }}</strong>
+                        <br><small class="text-muted">ID: {{ claim.patient_id }}</small>
+                    </td>
+                    <td rowspan="{{ claim.service_lines|length }}">{{ claim.patient_dob }}</td>
+                    {% endif %}
+                    <td>{{ line.date_of_service }}</td>
+                    <td><code>{{ line.cpt_code }}</code></td>
+                    <td>{{ line.units }}</td>
+                    <td>${{ "%.2f"|format(line.charges) }}</td>
+                    <td>{{ line.provider_name }}</td>
+                </tr>
+                {% endfor %}
+            {% endfor %}
+        </tbody>
+        <tfoot class="table-light">
+            <tr>
+                <td colspan="5" class="text-end"><strong>Total:</strong></td>
+                <td colspan="2">
+                    <strong>${{ "%.2f"|format(claims|sum(attribute='total_charges')) }}</strong>
+                </td>
+            </tr>
+        </tfoot>
+    </table>
+</div>
+
+<div class="row mt-4">
+    <div class="col-md-6">
+        <a href="{{ url_for('main.index') }}" class="btn btn-outline-secondary btn-lg w-100">
+            Cancel / Upload Different File
+        </a>
+    </div>
+    <div class="col-md-6">
+        <button type="button" class="btn btn-success btn-lg w-100" id="submitBtn" onclick="submitClaims()">
+            Submit to eBilling
+        </button>
+    </div>
+</div>
+
+<div id="submissionStatus" class="alert alert-info mt-4 d-none">
+    <div class="d-flex align-items-center">
+        <div class="spinner-border spinner-border-sm me-2" role="status"></div>
+        <span>Processing submission...</span>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const claimsData = {{ claims|tojson|safe }};
+
+async function submitClaims() {
+    const btn = document.getElementById('submitBtn');
+    const status = document.getElementById('submissionStatus');
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Submitting...';
+    status.classList.remove('d-none');
+
+    try {
+        const response = await fetch('{{ url_for("main.submit_claims") }}', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ claims: claimsData })
+        });
+
+        const result = await response.json();
+
+        status.classList.remove('alert-info');
+        status.classList.add('alert-success');
+        status.innerHTML = `
+            <strong>Success!</strong> ${result.message}
+            <br>Claims submitted: ${result.claim_count}
+        `;
+
+        btn.classList.remove('btn-success');
+        btn.classList.add('btn-secondary');
+        btn.innerHTML = 'Submitted';
+    } catch (error) {
+        status.classList.remove('alert-info');
+        status.classList.add('alert-danger');
+        status.innerHTML = `<strong>Error:</strong> ${error.message}`;
+        btn.disabled = false;
+        btn.innerHTML = 'Retry Submission';
+    }
+}
+</script>
+{% endblock %}

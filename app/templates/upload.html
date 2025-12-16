@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block title %}Upload CSV{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-header bg-primary text-white">
+                <h4 class="mb-0">Upload Billing Data</h4>
+            </div>
+            <div class="card-body">
+                <p class="text-muted">
+                    Upload your Office Ally CSV export to process for Regional Center eBilling submission.
+                </p>
+
+                <form action="{{ url_for('main.upload_file') }}" method="post" enctype="multipart/form-data">
+                    <div class="mb-4">
+                        <label for="file" class="form-label">Select CSV File</label>
+                        <input type="file" class="form-control form-control-lg" id="file" name="file" accept=".csv" required>
+                        <div class="form-text">
+                            Accepts Office Ally CMS-1500 format CSV exports
+                        </div>
+                    </div>
+
+                    <div class="d-grid">
+                        <button type="submit" class="btn btn-primary btn-lg">
+                            Upload & Preview
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <div class="card mt-4">
+            <div class="card-header">
+                <h5 class="mb-0">How It Works</h5>
+            </div>
+            <div class="card-body">
+                <ol class="mb-0">
+                    <li class="mb-2"><strong>Upload</strong> - Select your Office Ally CSV export</li>
+                    <li class="mb-2"><strong>Preview</strong> - Review parsed claims before submission</li>
+                    <li class="mb-2"><strong>Submit</strong> - Automation logs into DDS eBilling and enters claims</li>
+                    <li><strong>Track</strong> - Monitor submission status and confirmations</li>
+                </ol>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

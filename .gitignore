@@ -1,0 +1,43 @@
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Credentials & secrets (NEVER commit these)
+.credentials
+.credential_key
+*.key
+.env
+
+# Database
+*.db
+*.sqlite
+
+# Uploads
+uploads/
+
+# Screenshots from testing
+screenshots/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

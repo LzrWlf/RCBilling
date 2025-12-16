@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% block title %}Settings{% endblock %}
+
+{% block content %}
+<h2 class="mb-4">Settings</h2>
+
+<div class="row">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">eBilling Portal Credentials</h5>
+            </div>
+            <div class="card-body">
+                <p class="text-muted">
+                    Enter your DDS eBilling portal login credentials. These will be encrypted and stored securely.
+                </p>
+
+                <form action="{{ url_for('main.save_credentials') }}" method="post">
+                    <div class="mb-3">
+                        <label for="username" class="form-label">Username</label>
+                        <input type="text" class="form-control" id="username" name="username" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="password" class="form-label">Password</label>
+                        <input type="password" class="form-control" id="password" name="password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Save Credentials</button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Regional Center</h5>
+            </div>
+            <div class="card-body">
+                <p class="text-muted">
+                    Select your Regional Center. The DDS eBilling portal is statewide but some settings may vary.
+                </p>
+
+                <div class="mb-3">
+                    <label for="rc" class="form-label">Regional Center</label>
+                    <select class="form-select" id="rc" name="rc">
+                        <option value="ELARC" selected>ELARC - Eastern Los Angeles RC</option>
+                        <option value="RCEB">RCEB - Regional Center of the East Bay</option>
+                        <option value="GGRC">GGRC - Golden Gate Regional Center</option>
+                        <option value="SARC">SARC - San Andreas Regional Center</option>
+                        <option value="FNRC">FNRC - Far Northern Regional Center</option>
+                        <option value="OTHER">Other</option>
+                    </select>
+                </div>
+                <button type="button" class="btn btn-outline-primary">Update</button>
+            </div>
+        </div>
+
+        <div class="card mt-3">
+            <div class="card-header">
+                <h5 class="mb-0">Portal Connection</h5>
+            </div>
+            <div class="card-body">
+                <p class="mb-2">
+                    <strong>Portal URL:</strong>
+                    <code>ebilling.dds.ca.gov</code>
+                </p>
+                <button type="button" class="btn btn-outline-secondary btn-sm" id="testConnection">
+                    Test Connection
+                </button>
+                <span id="connectionStatus" class="ms-2"></span>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
