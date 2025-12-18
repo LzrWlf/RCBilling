@@ -1,7 +1,7 @@
 from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify, current_app
 from werkzeug.utils import secure_filename
 import os
-from app.csv_parser import parse_office_ally_csv
+from app.csv_parser import parse_office_ally_csv, claims_to_dict
 
 main_bp = Blueprint('main', __name__)
 
@@ -33,9 +33,10 @@ def upload_file():
         filepath = os.path.join(current_app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
 
-        # Parse the CSV
+        # Parse the CSV and convert to dicts for template
         try:
-            claims = parse_office_ally_csv(filepath)
+            claims_obj = parse_office_ally_csv(filepath)
+            claims = claims_to_dict(claims_obj)
             return render_template('preview.html', claims=claims, filename=filename)
         except Exception as e:
             flash(f'Error parsing CSV: {str(e)}', 'error')

@@ -12,5 +12,5 @@ class Config:
     # Encryption key for credentials (generate with: Fernet.generate_key())
     CREDENTIAL_KEY = os.environ.get('CREDENTIAL_KEY') or None
 
-    # DDS eBilling portal
-    EBILLING_URL = 'https://ebilling.dds.ca.gov:8373/login'
+    # DDS eBilling portal (SGPRC = port 8379, ELARC = port 8373)
+    EBILLING_URL = 'https://ebilling.dds.ca.gov:8379/login'
