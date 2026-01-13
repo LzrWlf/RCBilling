@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+
+{% block title %}Admin Dashboard{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2>Admin Dashboard</h2>
+    <a href="{{ url_for('admin.add_clinic') }}" class="btn btn-success">+ Add New Clinic</a>
+</div>
+
+<!-- Stats Cards -->
+<div class="row mb-4">
+    <div class="col-md-3">
+        <div class="card bg-primary text-white">
+            <div class="card-body text-center">
+                <h3>{{ total_clinics }}</h3>
+                <p class="mb-0">Total Clinics</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-success text-white">
+            <div class="card-body text-center">
+                <h3>{{ active_clinics }}</h3>
+                <p class="mb-0">Active Subscriptions</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-info text-white">
+            <div class="card-body text-center">
+                <h3>{{ total_submissions }}</h3>
+                <p class="mb-0">Total Submissions</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card bg-secondary text-white">
+            <div class="card-body text-center">
+                <h3>{{ total_services }}</h3>
+                <p class="mb-0">Services Processed</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Clinics Table -->
+<div class="card mb-4">
+    <div class="card-header">
+        <h5 class="mb-0">All Clinics</h5>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover">
+                <thead>
+                    <tr>
+                        <th>Clinic Name</th>
+                        <th>Email</th>
+                        <th>Regional Center</th>
+                        <th>Status</th>
+                        <th>Expires</th>
+                        <th>Submissions</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for clinic in clinics %}
+                    <tr>
+                        <td><strong>{{ clinic.clinic_name }}</strong></td>
+                        <td>{{ clinic.email }}</td>
+                        <td><span class="badge bg-info">{{ clinic.regional_center }}</span></td>
+                        <td>
+                            {% if clinic.is_subscription_active %}
+                            <span class="badge bg-success">Active</span>
+                            {% else %}
+                            <span class="badge bg-danger">Inactive</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if clinic.subscription_end %}
+                            {{ clinic.subscription_end.strftime('%m/%d/%Y') }}
+                            {% else %}
+                            -
+                            {% endif %}
+                        </td>
+                        <td>{{ clinic.total_submissions }}</td>
+                        <td>
+                            <a href="{{ url_for('admin.view_clinic', clinic_id=clinic.id) }}" class="btn btn-sm btn-outline-primary">View</a>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="7" class="text-center text-muted">No clinics yet</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- Recent Activity -->
+<div class="card">
+    <div class="card-header">
+        <h5 class="mb-0">Recent Submissions</h5>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-sm">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Clinic</th>
+                        <th>Records</th>
+                        <th>Success</th>
+                        <th>Failed</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for log in recent_logs %}
+                    <tr>
+                        <td>{{ log.timestamp.strftime('%m/%d %H:%M') }}</td>
+                        <td>{{ log.user.clinic_name }}</td>
+                        <td>{{ log.total_records }}</td>
+                        <td class="text-success">{{ log.successful }}</td>
+                        <td class="text-danger">{{ log.failed }}</td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="5" class="text-center text-muted">No submissions yet</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}

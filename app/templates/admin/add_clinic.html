@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block title %}Add New Clinic{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-8 offset-md-2">
+        <h2 class="mb-4">Add New Clinic</h2>
+
+        <div class="card">
+            <div class="card-body">
+                <form method="POST">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="clinic_name" class="form-label">Clinic Name *</label>
+                            <input type="text" class="form-control" id="clinic_name" name="clinic_name" required>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="email" class="form-label">Email *</label>
+                            <input type="email" class="form-control" id="email" name="email" required>
+                            <small class="text-muted">Used for login</small>
+                        </div>
+                    </div>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="password" class="form-label">Password *</label>
+                            <input type="password" class="form-control" id="password" name="password" required minlength="6">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="regional_center" class="form-label">Regional Center *</label>
+                            <select class="form-select" id="regional_center" name="regional_center" required>
+                                {% for rc in regional_centers %}
+                                <option value="{{ rc }}">{{ rc }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="mb-3">
+                        <label for="provider_name" class="form-label">Provider Name</label>
+                        <input type="text" class="form-control" id="provider_name" name="provider_name"
+                               placeholder="e.g., MY VOICE SPEECH">
+                        <small class="text-muted">Must match exactly as shown in eBilling portal</small>
+                    </div>
+
+                    <hr>
+
+                    <div class="d-flex gap-2">
+                        <button type="submit" class="btn btn-success">Create Clinic</button>
+                        <a href="{{ url_for('admin.dashboard') }}" class="btn btn-outline-secondary">Cancel</a>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

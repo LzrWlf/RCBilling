@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+
+{% block title %}Clinic Settings{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-8 offset-md-2">
+        <h2 class="mb-4">Clinic Settings</h2>
+
+        <div class="card mb-4">
+            <div class="card-header">
+                <h5 class="mb-0">eBilling Configuration</h5>
+            </div>
+            <div class="card-body">
+                <form method="POST">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="regional_center" class="form-label">Regional Center</label>
+                            <select class="form-select" id="regional_center" name="regional_center">
+                                {% for rc in regional_centers %}
+                                <option value="{{ rc }}" {% if current_user.regional_center == rc %}selected{% endif %}>
+                                    {{ rc }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="provider_name" class="form-label">Provider Name</label>
+                            <input type="text" class="form-control" id="provider_name" name="provider_name"
+                                   value="{{ current_user.provider_name }}"
+                                   placeholder="e.g., MY VOICE SPEECH">
+                            <small class="text-muted">Must match exactly as shown in eBilling portal</small>
+                        </div>
+                    </div>
+
+                    <hr>
+                    <h6>eBilling Portal Credentials</h6>
+
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <label for="ebilling_username" class="form-label">eBilling Username</label>
+                            <input type="text" class="form-control" id="ebilling_username" name="ebilling_username"
+                                   value="{{ eb_username }}">
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <label for="ebilling_password" class="form-label">eBilling Password</label>
+                            <input type="password" class="form-control" id="ebilling_password" name="ebilling_password"
+                                   placeholder="{% if eb_username %}(unchanged){% else %}Enter password{% endif %}">
+                            <small class="text-muted">Leave blank to keep existing password</small>
+                        </div>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary">Save Settings</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Account Info</h5>
+            </div>
+            <div class="card-body">
+                <p><strong>Clinic:</strong> {{ current_user.clinic_name }}</p>
+                <p><strong>Email:</strong> {{ current_user.email }}</p>
+                <p><strong>Subscription Status:</strong>
+                    {% if current_user.is_subscription_active %}
+                    <span class="badge bg-success">Active</span>
+                    {% else %}
+                    <span class="badge bg-danger">Inactive</span>
+                    {% endif %}
+                </p>
+                {% if current_user.subscription_end %}
+                <p><strong>Expires:</strong> {{ current_user.subscription_end.strftime('%B %d, %Y') }}</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

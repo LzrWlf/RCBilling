@@ -1,14 +1,14 @@
 {% extends "base.html" %}
 
-{% block title %}Preview Claims{% endblock %}
+{% block title %}Preview Billing Records{% endblock %}
 
 {% block content %}
 <div class="d-flex justify-content-between align-items-center mb-4">
-    <h2>Preview Claims</h2>
+    <h2>Preview Billing Records</h2>
     <div>
-        <span class="badge bg-primary fs-6">{{ claims|length }} Claims</span>
+        <span class="badge bg-primary fs-6">{{ claims|length }} Records</span>
         <span class="badge bg-success fs-6">
-            {{ claims|sum(attribute='service_lines'|length) }} Line Items
+            {{ claims|sum(attribute='days_count') }} Total Service Days
         </span>
     </div>
 </div>
@@ -23,41 +23,50 @@
     <table class="table table-striped table-hover">
         <thead class="table-dark">
             <tr>
-                <th>Patient</th>
-                <th>DOB</th>
-                <th>Date of Service</th>
-                <th>CPT Code</th>
+                <th>Consumer</th>
+                <th>UCI #</th>
+                <th>Auth #</th>
+                <th>SVC Code</th>
+                <th>Service Month</th>
+                <th>Service Days</th>
                 <th>Units</th>
-                <th>Charges</th>
-                <th>Provider</th>
+                <th>Amount</th>
             </tr>
         </thead>
         <tbody>
-            {% for claim in claims %}
-                {% for line in claim.service_lines %}
-                <tr>
-                    {% if loop.first %}
-                    <td rowspan="{{ claim.service_lines|length }}">
-                        <strong>{{ claim.patient_name }}</strong>
-                        <br><small class="text-muted">ID: {{ claim.patient_id }}</small>
-                    </td>
-                    <td rowspan="{{ claim.service_lines|length }}">{{ claim.patient_dob }}</td>
+            {% for record in claims %}
+            <tr>
+                <td>
+                    <strong>{{ record.consumer_name_display }}</strong>
+                </td>
+                <td><code>{{ record.uci }}</code></td>
+                <td>{{ record.auth_number }}</td>
+                <td>
+                    <code>{{ record.svc_code }}</code>
+                    {% if record.svc_subcode %}
+                    / <code>{{ record.svc_subcode }}</code>
                     {% endif %}
-                    <td>{{ line.date_of_service }}</td>
-                    <td><code>{{ line.cpt_code }}</code></td>
-                    <td>{{ line.units }}</td>
-                    <td>${{ "%.2f"|format(line.charges) }}</td>
-                    <td>{{ line.provider_name }}</td>
-                </tr>
-                {% endfor %}
+                </td>
+                <td>{{ record.service_month }}</td>
+                <td>
+                    <span class="badge bg-info">{{ record.days_count }} days</span>
+                    <br>
+                    <small class="text-muted">
+                        {% for day in record.service_days %}
+                            {{ day }}{% if not loop.last %}, {% endif %}
+                        {% endfor %}
+                    </small>
+                </td>
+                <td>{{ record.entered_units }}</td>
+                <td>${{ "%.2f"|format(record.entered_amount) }}</td>
+            </tr>
             {% endfor %}
         </tbody>
         <tfoot class="table-light">
             <tr>
-                <td colspan="5" class="text-end"><strong>Total:</strong></td>
-                <td colspan="2">
-                    <strong>${{ "%.2f"|format(claims|sum(attribute='total_charges')) }}</strong>
-                </td>
+                <td colspan="6" class="text-end"><strong>Total:</strong></td>
+                <td><strong>{{ claims|sum(attribute='entered_units') }}</strong></td>
+                <td><strong>${{ "%.2f"|format(claims|sum(attribute='entered_amount')) }}</strong></td>
             </tr>
         </tfoot>
     </table>
@@ -107,11 +116,40 @@ async function submitClaims() {
 
         const result = await response.json();
 
+        if (result.status === 'error') {
+            status.classList.remove('alert-info');
+            status.classList.add('alert-danger');
+            status.innerHTML = `<strong>Error:</strong> ${result.message}`;
+            btn.disabled = false;
+            btn.innerHTML = 'Retry Submission';
+            return;
+        }
+
         status.classList.remove('alert-info');
         status.classList.add('alert-success');
+
+        let detailsHtml = '';
+        if (result.results) {
+            detailsHtml = '<ul class="mt-2 mb-0">';
+            result.results.forEach(r => {
+                const icon = r.success ? '✓' : '✗';
+                const text = r.success
+                    ? `${r.consumer_name} - ${r.days_entered} days entered`
+                    : `${r.consumer_name} - ${r.error}`;
+                detailsHtml += `<li>${icon} ${text}</li>`;
+            });
+            detailsHtml += '</ul>';
+        }
+
         status.innerHTML = `
-            <strong>Success!</strong> ${result.message}
-            <br>Claims submitted: ${result.claim_count}
+            <strong>Complete!</strong> ${result.message}
+            <br>Success: ${result.success_count} | Failed: ${result.failed_count}
+            ${detailsHtml}
+            <div class="mt-3">
+                <a href="{{ url_for('main.download_report') }}" class="btn btn-primary">
+                    Download Submission Report
+                </a>
+            </div>
         `;
 
         btn.classList.remove('btn-success');

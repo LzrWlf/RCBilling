@@ -1,134 +1,166 @@
 """
-CSV Parser for Office Ally CMS-1500 format
-Extracts billing data for Regional Center eBilling submission
+CSV Parser for Regional Center Billing Format
+Extracts billing data for DDS eBilling portal submission
 """
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 from datetime import datetime
 
 
 @dataclass
-class ServiceLine:
-    """A single service line item"""
-    date_of_service: str
-    cpt_code: str
-    units: int
-    charges: float
-    place_of_service: str
-    provider_npi: str
-    provider_name: str
+class BillingRecord:
+    """A billing record for a consumer's monthly services"""
+    # Identifiers
+    uci: str                    # UCI# - Consumer ID
+    lastname: str               # Consumer last name
+    firstname: str              # Consumer first name
+    auth_number: str            # Authorization number
+    svc_code: str               # Service code (e.g., 116)
+    svc_subcode: str            # Service subcode (e.g., 1FK)
+    svc_month_year: str         # Service month/year (e.g., 2025-12-01)
 
+    # Provider info
+    spn_id: str                 # Service Provider Number ID
+    rc_id: str                  # Regional Center ID
 
-@dataclass
-class Claim:
-    """A claim with patient info and service lines"""
-    patient_id: str
-    patient_first: str
-    patient_last: str
-    patient_dob: str
-    facility_name: str
-    service_lines: List[ServiceLine]
+    # Service days (1-31) - which days had service
+    service_days: List[int] = field(default_factory=list)
 
-    @property
-    def patient_name(self) -> str:
-        return f"{self.patient_first} {self.patient_last}"
+    # Totals
+    entered_units: float = 0.0
+    entered_amount: float = 0.0
 
     @property
-    def total_charges(self) -> float:
-        return sum(line.charges for line in self.service_lines)
+    def consumer_name(self) -> str:
+        """Full consumer name as it appears in portal"""
+        return f"{self.lastname.upper()}, {self.firstname.upper()}"
+
+    @property
+    def consumer_name_display(self) -> str:
+        """Consumer name for display"""
+        return f"{self.firstname} {self.lastname}"
+
+    @property
+    def service_month(self) -> str:
+        """Extract month/year in MM/YYYY format"""
+        try:
+            # Parse date like "2025-12-01" or " 2025-12-01"
+            date_str = self.svc_month_year.strip()
+            if '-' in date_str:
+                parts = date_str.split('-')
+                return f"{parts[1]}/{parts[0]}"  # MM/YYYY
+            return date_str
+        except:
+            return self.svc_month_year
+
+    @property
+    def days_count(self) -> int:
+        """Number of service days"""
+        return len(self.service_days)
 
 
-def parse_office_ally_csv(filepath: str) -> List[Claim]:
+def parse_rc_billing_csv(filepath: str) -> List[BillingRecord]:
     """
-    Parse Office Ally CMS-1500 CSV export format.
+    Parse Regional Center Billing CSV format.
 
-    The CSV has up to 6 service lines per row (CPT1-6, etc.)
+    Columns:
+    - RecType, RCID, AttOnlyFlag, SPNID, UCI, Lastname, Firstname
+    - AuthNumber, SVCCode, SVCSCode, SVCMnYr
+    - IndustryType, WageAmt, WageType
+    - Day1-Day31 (service days)
+    - EnteredUnits, EnteredAmount
     """
     df = pd.read_csv(filepath, dtype=str)
     df = df.fillna('')
 
-    claims = []
+    records = []
 
     for _, row in df.iterrows():
-        service_lines = []
+        # Skip header rows or non-data rows
+        rec_type = str(row.get('RecType', '')).strip().strip('"')
+        if rec_type != 'D':
+            continue
 
-        # Extract up to 6 service lines per row
-        for i in range(1, 7):
-            cpt_col = f'CPT{i}'
-            if cpt_col in row and row[cpt_col].strip():
-                cpt_code = row[cpt_col].strip()
+        # Extract service days (Day1-Day31)
+        service_days = []
+        for day_num in range(1, 32):
+            day_col = f'Day{day_num}'
+            if day_col in row:
+                day_val = str(row[day_col]).strip().strip('"')
+                if day_val and day_val not in ['', '0']:
+                    service_days.append(day_num)
 
-                # Get corresponding fields for this line
-                dos_from = row.get(f'FromDateOfService{i}', '').strip()
-                units = row.get(f'Units{i}', '1').strip()
-                charges = row.get(f'Charges{i}', '0').strip()
-                pos = row.get(f'PlaceOfService{i}', '').strip()
-                provider_npi = row.get(f'RenderingPhysNPI{i}', '').strip()
+        # Parse units and amount
+        try:
+            units_str = str(row.get('EnteredUnits', '0')).strip().strip('"')
+            entered_units = float(units_str) if units_str else 0.0
+        except ValueError:
+            entered_units = 0.0
 
-                # Get provider name from main fields (same for all lines)
-                provider_first = row.get('PhysicianFirst', '').strip()
-                provider_last = row.get('PhysicianLast', '').strip()
-                provider_name = f"{provider_first} {provider_last}".strip()
+        try:
+            # Handle the weird format where amount might be attached to units column
+            amount_col = 'EnteredAmount' if 'EnteredAmount' in row else 'EnteredAmount"D"'
+            amount_str = str(row.get(amount_col, '0')).strip().strip('"')
+            entered_amount = float(amount_str) if amount_str else 0.0
+        except ValueError:
+            entered_amount = 0.0
 
-                try:
-                    units_int = int(float(units)) if units else 1
-                except ValueError:
-                    units_int = 1
+        # Clean string fields
+        def clean(val):
+            return str(val).strip().strip('"')
 
-                try:
-                    charges_float = float(charges) if charges else 0.0
-                except ValueError:
-                    charges_float = 0.0
+        record = BillingRecord(
+            uci=clean(row.get('UCI', '')),
+            lastname=clean(row.get('Lastname', '')),
+            firstname=clean(row.get('Firstname', '')),
+            auth_number=clean(row.get('AuthNumber', '')),
+            svc_code=clean(row.get('SVCCode', '')),
+            svc_subcode=clean(row.get('SVCSCode', '')),
+            svc_month_year=clean(row.get('SVCMnYr', '')),
+            spn_id=clean(row.get('SPNID', '')),
+            rc_id=clean(row.get('RCID', '')),
+            service_days=service_days,
+            entered_units=entered_units,
+            entered_amount=entered_amount
+        )
+        records.append(record)
 
-                service_lines.append(ServiceLine(
-                    date_of_service=dos_from,
-                    cpt_code=cpt_code,
-                    units=units_int,
-                    charges=charges_float,
-                    place_of_service=pos,
-                    provider_npi=provider_npi,
-                    provider_name=provider_name
-                ))
-
-        if service_lines:
-            claim = Claim(
-                patient_id=row.get('PatientID', '').strip(),
-                patient_first=row.get('PatientFirst', '').strip(),
-                patient_last=row.get('PatientLast', '').strip(),
-                patient_dob=row.get('PatientDOB', '').strip(),
-                facility_name=row.get('FacilityName', '').strip(),
-                service_lines=service_lines
-            )
-            claims.append(claim)
-
-    return claims
+    return records
 
 
-def claims_to_dict(claims: List[Claim]) -> List[dict]:
-    """Convert claims to dictionary format for JSON/template rendering"""
+def records_to_dict(records: List[BillingRecord]) -> List[dict]:
+    """Convert billing records to dictionary format for JSON/template rendering"""
     result = []
-    for claim in claims:
-        claim_dict = {
-            'patient_id': claim.patient_id,
-            'patient_name': claim.patient_name,
-            'patient_first': claim.patient_first,
-            'patient_last': claim.patient_last,
-            'patient_dob': claim.patient_dob,
-            'facility_name': claim.facility_name,
-            'total_charges': claim.total_charges,
-            'service_lines': [
-                {
-                    'date_of_service': line.date_of_service,
-                    'cpt_code': line.cpt_code,
-                    'units': line.units,
-                    'charges': line.charges,
-                    'place_of_service': line.place_of_service,
-                    'provider_npi': line.provider_npi,
-                    'provider_name': line.provider_name
-                }
-                for line in claim.service_lines
-            ]
+    for rec in records:
+        rec_dict = {
+            'uci': rec.uci,
+            'consumer_name': rec.consumer_name,
+            'consumer_name_display': rec.consumer_name_display,
+            'lastname': rec.lastname,
+            'firstname': rec.firstname,
+            'auth_number': rec.auth_number,
+            'svc_code': rec.svc_code,
+            'svc_subcode': rec.svc_subcode,
+            'svc_month_year': rec.svc_month_year,
+            'service_month': rec.service_month,
+            'spn_id': rec.spn_id,
+            'rc_id': rec.rc_id,
+            'service_days': rec.service_days,
+            'days_count': rec.days_count,
+            'entered_units': rec.entered_units,
+            'entered_amount': rec.entered_amount,
         }
-        result.append(claim_dict)
+        result.append(rec_dict)
     return result
+
+
+# Keep old function names for backwards compatibility
+def parse_office_ally_csv(filepath: str) -> List[BillingRecord]:
+    """Alias for parse_rc_billing_csv for backwards compatibility"""
+    return parse_rc_billing_csv(filepath)
+
+
+def claims_to_dict(claims: List[BillingRecord]) -> List[dict]:
+    """Alias for records_to_dict for backwards compatibility"""
+    return records_to_dict(claims)

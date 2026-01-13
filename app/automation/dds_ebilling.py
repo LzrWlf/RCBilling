@@ -3,15 +3,22 @@ DDS eBilling Portal Automation using Playwright
 
 This module handles automated login and invoice submission to the
 California DDS (Department of Developmental Services) eBilling portal.
-Used by all Regional Centers statewide.
 
-Portal URLs by Regional Center (different ports):
-- SGPRC (San Gabriel/Pomona): https://ebilling.dds.ca.gov:8379/login
-- ELARC (Eastern LA): https://ebilling.dds.ca.gov:8373/login
+Portal Flow:
+1. Login page → Click LAUNCH APPLICATION → Opens popup
+2. Enter credentials → Login
+3. Accept user agreement
+4. Select provider
+5. Click Invoices tab
+6. Search for invoices
+7. Click EDIT on invoice row → navigates to /invoices/invoiceview
+8. Click Days Attend "0" → navigates to /invoices/unitcalendar
+9. Enter units for each service day in calendar
+10. Click Update to save
 """
 from playwright.sync_api import sync_playwright, Page, Browser
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Dict
 import logging
 import time
 
@@ -27,45 +34,29 @@ RC_PORTAL_URLS = {
 
 @dataclass
 class SubmissionResult:
-    """Result of a claim submission"""
+    """Result of a billing submission"""
     success: bool
-    confirmation_number: Optional[str] = None
+    consumer_name: str = ""
+    uci: str = ""
+    days_entered: int = 0
     error_message: Optional[str] = None
-    screenshot_path: Optional[str] = None
 
 
 class DDSeBillingBot:
     """
     Automation bot for DDS eBilling portal.
-
-    Portal Flow (mapped from SGPRC):
-    1. LAUNCH APPLICATION button → opens popup
-    2. Login (USERNAME, PASSWORD fields)
-    3. ACCEPT user agreement popup
-    4. Select provider (click table row)
-    5. OK confirmation popup (sometimes auto-dismisses)
-    6. Click INVOICES tab
-    7. Enter UCI# in search field → click SEARCH
-    8. Click invoice row → monthly invoice list
-    9. Click "0" in days attend column → calendar view
-    10. Click day cell → type units
-    11. Click UPDATE to save
     """
 
-    PORTAL_URL = "https://ebilling.dds.ca.gov:8379/login"  # Default to SGPRC
-
-    def __init__(self, username: str, password: str, headless: bool = True,
-                 regional_center: str = 'SGPRC', use_chrome: bool = True):
+    def __init__(self, username: str, password: str, headless: bool = False,
+                 regional_center: str = 'ELARC'):
         self.username = username
         self.password = password
         self.headless = headless
-        self.use_chrome = use_chrome
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
+        self.context = None
         self.playwright = None
-
-        # Set portal URL based on regional center
-        self.PORTAL_URL = RC_PORTAL_URLS.get(regional_center, RC_PORTAL_URLS['SGPRC'])
+        self.portal_url = RC_PORTAL_URLS.get(regional_center, RC_PORTAL_URLS['ELARC'])
 
     def __enter__(self):
         self.start()
@@ -76,22 +67,17 @@ class DDSeBillingBot:
 
     def start(self):
         """Start browser session"""
-        logger.info("Starting Playwright browser...")
+        logger.info("Starting browser...")
         self.playwright = sync_playwright().start()
-
-        # Use Chrome if available, otherwise fall back to Chromium
-        launch_args = {
-            'headless': self.headless,
-            'args': ['--disable-blink-features=AutomationControlled']
-        }
-        if self.use_chrome:
-            launch_args['channel'] = 'chrome'
-            logger.info("Using Chrome browser")
-
-        self.browser = self.playwright.chromium.launch(**launch_args)
-        self.page = self.browser.new_page()
+        self.browser = self.playwright.chromium.launch(
+            headless=self.headless,
+            channel='chrome',
+            args=['--disable-blink-features=AutomationControlled']
+        )
+        self.context = self.browser.new_context()
+        self.page = self.context.new_page()
         self.page.set_viewport_size({"width": 1400, "height": 900})
-        logger.info("Browser started successfully")
+        logger.info("Browser started")
 
     def stop(self):
         """Close browser session"""
@@ -99,647 +85,466 @@ class DDSeBillingBot:
             self.browser.close()
         if self.playwright:
             self.playwright.stop()
-        logger.info("Browser session closed")
+        logger.info("Browser closed")
+
+    def _js_click(self, text: str) -> bool:
+        """Click element containing text using JavaScript - most reliable method"""
+        try:
+            result = self.page.evaluate(f'''() => {{
+                const elements = document.querySelectorAll('input, button, a, span, td');
+                for (const el of elements) {{
+                    const t = el.value || el.innerText || '';
+                    if (t.trim() === '{text}') {{
+                        el.click();
+                        return true;
+                    }}
+                }}
+                return false;
+            }}''')
+            return result
+        except:
+            return False
 
     def login(self) -> bool:
-        """
-        Login to DDS eBilling portal.
-
-        Returns:
-            True if login successful, False otherwise
-        """
+        """Login to the portal"""
         try:
-            logger.info(f"Navigating to {self.PORTAL_URL}")
-            self.page.goto(self.PORTAL_URL, wait_until="networkidle")
+            logger.info(f"Navigating to {self.portal_url}")
+            self.page.goto(self.portal_url, wait_until="networkidle")
+            time.sleep(2)
 
-            # Step 1: Click "LAUNCH APPLICATION" button on landing page
-            # This opens a NEW WINDOW for login
-            logger.info("Looking for LAUNCH APPLICATION button...")
+            # Click LAUNCH APPLICATION
+            logger.info("Clicking LAUNCH APPLICATION...")
+            with self.context.expect_page() as new_page_info:
+                self.page.mouse.click(910, 200)
 
-            # Set up popup handler before clicking
-            with self.page.expect_popup() as popup_info:
-                launch_btn = self.page.query_selector('button:has-text("LAUNCH APPLICATION"), input:has-text("LAUNCH APPLICATION"), a:has-text("LAUNCH APPLICATION"), [value*="LAUNCH"], :has-text("LAUNCH")')
-                if launch_btn:
-                    logger.info("Clicking LAUNCH APPLICATION...")
-                    launch_btn.click()
+            # Switch to login popup
+            self.page = new_page_info.value
+            self.page.wait_for_load_state("networkidle")
+            time.sleep(2)
 
-            # Switch to the login popup window
-            login_page = popup_info.value
-            login_page.wait_for_load_state("networkidle")
-            logger.info("Login window opened")
-
-            # Wait for login form in popup
-            login_page.wait_for_selector('input[name="username"], input[id="username"], input[type="text"]', timeout=10000)
-
-            # Fill credentials
+            # Enter credentials
             logger.info("Entering credentials...")
-            login_page.fill('input[name="username"], input[id="username"], input[type="text"]', self.username)
-            login_page.fill('input[name="password"], input[id="password"], input[type="password"]', self.password)
+            self.page.wait_for_selector('input[type="text"]', timeout=15000)
+            self.page.query_selector('input[type="text"]').fill(self.username)
+            self.page.query_selector('input[type="password"]').fill(self.password)
+            self.page.query_selector('input[type="password"]').press("Enter")
+            self.page.wait_for_load_state("networkidle")
+            time.sleep(3)
 
-            # Click login button
-            login_page.click('button[type="submit"], input[type="submit"], button:has-text("Login"), input[value="Login"]')
+            # Accept agreement using JavaScript
+            logger.info("Accepting agreement...")
+            time.sleep(2)
+            self.page.evaluate('''() => {
+                const elements = document.querySelectorAll('input, button, a');
+                for (const el of elements) {
+                    const text = el.value || el.innerText || '';
+                    if (text.trim() === 'Accept') {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }''')
+            self.page.wait_for_load_state("networkidle")
+            time.sleep(2)
 
-            # Wait for navigation after login
-            login_page.wait_for_load_state("networkidle")
-
-            # Check for password update requirement
-            if login_page.query_selector(':has-text("password update"), :has-text("change password"), :has-text("password expired")'):
-                logger.warning("Password update required - manual intervention needed")
-                return False
-
-            # Check if login was successful (look for dashboard elements or error messages)
-            if login_page.query_selector('.error, .alert-danger, .login-error, :has-text("invalid")'):
-                logger.error("Login failed - invalid credentials")
-                return False
-
-            # Handle user agreement popup
-            logger.info("Checking for user agreement popup...")
-            accept_btn = login_page.query_selector('button:has-text("Accept"), button:has-text("I Agree"), button:has-text("ACCEPT"), input[value*="Accept"], input[value*="Agree"], a:has-text("Accept")')
-            if accept_btn:
-                logger.info("Clicking Accept on user agreement...")
-                accept_btn.click()
-                login_page.wait_for_load_state("networkidle")
-
-            # Update self.page to point to the logged-in window
-            self.page = login_page
             logger.info("Login successful")
             return True
 
+        except Exception as e:
+            logger.error(f"Login failed: {e}")
+            return False
+
     def select_provider(self, provider_name: str) -> bool:
-        """
-        Select service provider from the provider selection list.
-
-        Args:
-            provider_name: Name of the provider to select (or partial match)
-
-        Returns:
-            True if provider selected successfully
-        """
+        """Select the service provider"""
         try:
-            logger.info(f"Looking for provider: {provider_name}")
+            logger.info(f"Selecting provider: {provider_name}")
+            self.page.click(f'tr:has-text("{provider_name}")', timeout=5000)
+            time.sleep(2)
+            try:
+                self._js_click("OK")
+            except:
+                pass
+            self.page.wait_for_load_state("networkidle")
+            time.sleep(2)
+            return True
+        except Exception as e:
+            logger.error(f"Provider selection failed: {e}")
+            return False
 
-            # Look for provider in selection list/portal
-            # Try various selector patterns
-            provider_selectors = [
-                f'text="{provider_name}"',
-                f'a:has-text("{provider_name}")',
-                f'td:has-text("{provider_name}")',
-                f'div:has-text("{provider_name}")',
-                f'span:has-text("{provider_name}")',
-                f'*:has-text("{provider_name}")'
-            ]
+    def navigate_to_invoices(self) -> bool:
+        """Navigate to Invoices tab and search"""
+        try:
+            logger.info("Clicking Invoices tab...")
+            self.page.click('a:has-text("Invoices")', timeout=5000)
+            self.page.wait_for_load_state("networkidle")
+            time.sleep(2)
 
-            for selector in provider_selectors:
-                provider_elem = self.page.query_selector(selector)
-                if provider_elem:
-                    logger.info(f"Found provider, clicking...")
-                    provider_elem.click()
-                    break
-            else:
-                logger.error(f"Provider '{provider_name}' not found")
-                return False
+            logger.info("Clicking Search...")
+            self._js_click("Search")
+            self.page.wait_for_load_state("networkidle")
+            time.sleep(3)
 
-            # Wait for and handle "provider is selected" confirmation popup
-            self.page.wait_for_timeout(1000)  # Brief wait for popup
+            return True
+        except Exception as e:
+            logger.error(f"Navigation failed: {e}")
+            return False
 
-            ok_btn = self.page.query_selector('button:has-text("OK"), button:has-text("Ok"), input[value="OK"], input[value="Ok"], button:has-text("ok")')
-            if ok_btn:
-                logger.info("Clicking OK on provider selection confirmation...")
-                ok_btn.click()
+    def open_invoice_details(self, consumer_name: str) -> bool:
+        """Click EDIT to open invoice details for a consumer"""
+        try:
+            logger.info(f"Opening invoice details for: {consumer_name}")
+
+            # Try multiple methods to click EDIT
+            clicked = False
+
+            # Method 1: Playwright text locator for EDIT
+            try:
+                self.page.get_by_text("EDIT").first.click(timeout=5000)
+                clicked = True
+                logger.info("Clicked EDIT via text locator")
+            except Exception as e:
+                logger.warning(f"Text locator failed: {e}")
+
+            # Method 2: Click on the pencil image
+            if not clicked:
+                try:
+                    self.page.locator('img').last.click(timeout=3000)
+                    clicked = True
+                    logger.info("Clicked pencil image")
+                except Exception as e:
+                    logger.warning(f"Image click failed: {e}")
+
+            # Method 3: JavaScript - find link containing image and click
+            if not clicked:
+                try:
+                    result = self.page.evaluate('''() => {
+                        // Find all links with images
+                        const links = document.querySelectorAll('a');
+                        for (const link of links) {
+                            if (link.querySelector('img') || link.innerText.includes('EDIT')) {
+                                link.click();
+                                return 'clicked';
+                            }
+                        }
+                        // Try clicking any clickable element with EDIT text
+                        const all = document.querySelectorAll('*');
+                        for (const el of all) {
+                            if (el.innerText === 'EDIT' && el.click) {
+                                el.click();
+                                return 'clicked element';
+                            }
+                        }
+                        return 'not found';
+                    }''')
+                    logger.info(f"JS click result: {result}")
+                    clicked = result != 'not found'
+                except Exception as e:
+                    logger.warning(f"JS click failed: {e}")
+
+            self.page.wait_for_load_state("networkidle")
+            time.sleep(3)
+
+            # Verify we're on the invoice view page
+            if '/invoices/invoiceview' in self.page.url:
+                logger.info("Opened invoice details page")
+                return True
+
+            logger.warning("May not have navigated to invoice details")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to open invoice details: {e}")
+            return False
+
+    def open_calendar(self, uci: str, svc_code: str, auth_number: str) -> bool:
+        """Click on Days Attend to open the calendar for a specific line"""
+        try:
+            logger.info(f"Opening calendar for UCI: {uci}, SVC: {svc_code}, Auth: {auth_number}")
+
+            # Find the matching row and click on Days Attend (the "0" cell)
+            clicked = self.page.evaluate(f'''() => {{
+                const rows = document.querySelectorAll('tr');
+                for (const row of rows) {{
+                    const text = row.innerText;
+                    // Match by UCI and SVC code
+                    if (text.includes('{uci}') && text.includes('{svc_code}')) {{
+                        const cells = row.querySelectorAll('td');
+                        // Days Attend is usually around column 9-10, shows "0"
+                        for (let i = 8; i < cells.length; i++) {{
+                            const cellText = cells[i].innerText.trim();
+                            if (cellText === '0' || cellText === '') {{
+                                cells[i].click();
+                                return true;
+                            }}
+                        }}
+                    }}
+                }}
+                return false;
+            }}''')
+
+            if clicked:
                 self.page.wait_for_load_state("networkidle")
+                time.sleep(3)
 
-            logger.info(f"Provider '{provider_name}' selected successfully")
+                # Verify we're on the calendar page
+                if '/invoices/unitcalendar' in self.page.url:
+                    logger.info("Opened calendar page")
+                    return True
+
+            logger.warning("May not have opened calendar")
+            return clicked
+
+        except Exception as e:
+            logger.error(f"Failed to open calendar: {e}")
+            return False
+
+    def enter_service_days(self, service_days: List[int], units_per_day: int = 1) -> bool:
+        """Enter units for each service day in the calendar"""
+        try:
+            logger.info(f"Entering units for days: {service_days}")
+
+            # The calendar has input fields for each day
+            # Find inputs by their position in the calendar grid
+            for day in service_days:
+                # Find the input field for this day
+                # Calendar inputs are typically identified by day number
+                self.page.evaluate(f'''() => {{
+                    // Find all cells in calendar
+                    const cells = document.querySelectorAll('td');
+                    for (const cell of cells) {{
+                        // Look for cell containing the day number
+                        const daySpan = cell.querySelector('span, div');
+                        const input = cell.querySelector('input[type="text"]');
+
+                        if (input) {{
+                            // Check if this cell is for day {day}
+                            const cellText = cell.innerText.trim();
+                            if (cellText.startsWith('{day}') || cellText === '{day}') {{
+                                input.value = '{units_per_day}';
+                                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                return true;
+                            }}
+                        }}
+                    }}
+
+                    // Alternative: find input by looking at day numbers
+                    const allInputs = document.querySelectorAll('input[type="text"]');
+                    // Calendar typically has day numbers followed by input fields
+                    return false;
+                }}''')
+
+            # Wait a moment for form to update
+            time.sleep(1)
+            logger.info(f"Entered units for {len(service_days)} days")
             return True
 
         except Exception as e:
-            logger.error(f"Provider selection error: {str(e)}")
+            logger.error(f"Failed to enter service days: {e}")
             return False
 
-    def navigate_to_invoice_entry(self) -> bool:
-        """
-        Navigate to the invoice/claim entry section.
-        Clicks on "Invoices" tab at the top of the page.
-
-        Returns:
-            True if navigation successful
-        """
+    def enter_calendar_units(self, service_days: List[int], units_per_day: int = 1) -> int:
+        """Enter units in calendar input fields for specified days"""
         try:
-            logger.info("Navigating to Invoices tab...")
+            logger.info(f"Entering {units_per_day} unit(s) for days: {service_days}")
 
-            # Click on Invoices tab at top of page
-            invoice_tab_selectors = [
-                'a:has-text("Invoices")',
-                'tab:has-text("Invoices")',
-                'li:has-text("Invoices")',
-                'span:has-text("Invoices")',
-                '*[role="tab"]:has-text("Invoices")',
-                'a:has-text("INVOICES")',
-                'text="Invoices"'
-            ]
+            days_entered = 0
 
-            for selector in invoice_tab_selectors:
-                tab = self.page.query_selector(selector)
-                if tab:
-                    logger.info(f"Found Invoices tab, clicking...")
-                    tab.click()
-                    self.page.wait_for_load_state("networkidle")
-                    logger.info("Navigated to Invoices")
-                    return True
+            # Get all input fields in the calendar
+            # The calendar structure has day numbers with input fields below them
+            for day in service_days:
+                try:
+                    # Find and fill the input for this day
+                    # Calendar inputs are in table cells, day number is visible text
+                    result = self.page.evaluate(f'''() => {{
+                        // Look through all table cells
+                        const cells = document.querySelectorAll('td');
+                        for (const cell of cells) {{
+                            const text = cell.innerText.trim();
+                            const input = cell.querySelector('input');
 
-            logger.error("Could not find Invoices tab")
-            return False
+                            // Check if cell contains our day number and has an input
+                            if (text.includes('{day}') && input) {{
+                                // Make sure it's the right day (not just contains the digit)
+                                const lines = text.split('\\n');
+                                if (lines[0].trim() === '{day}') {{
+                                    input.value = '{units_per_day}';
+                                    input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                                    input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                                    return true;
+                                }}
+                            }}
+                        }}
+                        return false;
+                    }}''')
+
+                    if result:
+                        days_entered += 1
+                        logger.info(f"  Entered unit for day {day}")
+                    else:
+                        logger.warning(f"  Could not find input for day {day}")
+
+                except Exception as e:
+                    logger.warning(f"  Error entering day {day}: {e}")
+
+            time.sleep(1)
+            return days_entered
 
         except Exception as e:
-            logger.error(f"Navigation error: {str(e)}")
-            return False
+            logger.error(f"Calendar entry failed: {e}")
+            return 0
 
-    def search_by_uci(self, uci_number: str) -> bool:
-        """
-        Search for invoices by UCI# (unique client identifier).
-        UCI# in portal = PatientID in Office Ally CSV.
-
-        Args:
-            uci_number: The UCI# to search for
-
-        Returns:
-            True if search successful
-        """
+    def click_update(self) -> bool:
+        """Click Update button to save calendar entries"""
         try:
-            logger.info(f"Searching for UCI#: {uci_number}")
-
-            # Find UCI# input field - try various selectors
-            uci_input_selectors = [
-                'input[name*="uci" i]',
-                'input[id*="uci" i]',
-                'input[placeholder*="UCI" i]',
-                'input[name*="UCI"]',
-                'input[id*="UCI"]',
-            ]
-
-            uci_input = None
-            for selector in uci_input_selectors:
-                uci_input = self.page.query_selector(selector)
-                if uci_input:
-                    break
-
-            if not uci_input:
-                # Try to find by label
-                label = self.page.query_selector('label:has-text("UCI")')
-                if label:
-                    input_id = label.get_attribute('for')
-                    if input_id:
-                        uci_input = self.page.query_selector(f'#{input_id}')
-
-            if uci_input:
-                logger.info("Found UCI# input field, entering number...")
-                uci_input.fill(uci_number)
-            else:
-                logger.warning("Could not find UCI# input field, trying blank search")
-
-            # Click Search button
-            return self.search_invoices()
-
-        except Exception as e:
-            logger.error(f"UCI search error: {str(e)}")
-            return False
-
-    def search_invoices(self) -> bool:
-        """
-        Search for invoices. Click Search to show results.
-
-        Returns:
-            True if search successful
-        """
-        try:
-            logger.info("Clicking Search button...")
-
-            search_btn_selectors = [
-                'input[value="Search"]',
-                'button:has-text("Search")',
-                'input[type="submit"][value*="Search"]',
-                'button:has-text("SEARCH")',
-                'a:has-text("Search")',
-                '#searchBtn',
-                '.search-button'
-            ]
-
-            for selector in search_btn_selectors:
-                search_btn = self.page.query_selector(selector)
-                if search_btn:
-                    search_btn.click()
-                    self.page.wait_for_load_state("networkidle")
-                    self.page.wait_for_timeout(1000)  # Wait for results to load
-                    logger.info("Invoice search completed")
-                    return True
-
-            logger.error("Could not find Search button")
-            return False
-
-        except Exception as e:
-            logger.error(f"Invoice search error: {str(e)}")
-            return False
-
-    def click_invoice_row(self, invoice_identifier: str = None) -> bool:
-        """
-        Click on an invoice row from the search results.
-        This opens the monthly invoice list for that client.
-
-        Args:
-            invoice_identifier: Optional text to identify specific invoice (client name, UCI#, etc.)
-
-        Returns:
-            True if successfully clicked on an invoice row
-        """
-        try:
-            logger.info("Looking for invoice row to click...")
-
-            if invoice_identifier:
-                # Try to find row containing the identifier and click it
-                row = self.page.query_selector(f'tr:has-text("{invoice_identifier}")')
-                if row:
-                    row.click()
-                    self.page.wait_for_load_state("networkidle")
-                    self.page.wait_for_timeout(1000)
-                    logger.info(f"Clicked invoice row: {invoice_identifier}")
-                    return True
-
-            # Otherwise click first available data row (skip header)
-            rows = self.page.query_selector_all('table tr')
-            for row in rows[1:]:  # Skip header row
-                # Check if it's a data row (has td elements)
-                if row.query_selector('td'):
-                    row.click()
-                    self.page.wait_for_load_state("networkidle")
-                    self.page.wait_for_timeout(1000)
-                    logger.info("Clicked first invoice row")
-                    return True
-
-            logger.error("Could not find any invoice rows")
-            return False
-
-        except Exception as e:
-            logger.error(f"Invoice row click error: {str(e)}")
-            return False
-
-    def click_days_attend(self, client_identifier: str = None) -> bool:
-        """
-        Click on the "0" (or number) in the days attend column to open the calendar.
-        This is the entry point to the calendar view for entering service dates.
-
-        Args:
-            client_identifier: Optional client name or UCI# to find specific row
-
-        Returns:
-            True if successfully opened calendar view
-        """
-        try:
-            logger.info("Looking for days attend link to open calendar...")
-
-            if client_identifier:
-                # Find row with client identifier
-                row = self.page.query_selector(f'tr:has-text("{client_identifier}")')
-                if row:
-                    # Look for clickable element (usually "0" or a number) in days column
-                    days_link = row.query_selector('a, td a, [onclick]')
-                    if days_link:
-                        days_link.click()
-                        self.page.wait_for_load_state("networkidle")
-                        self.page.wait_for_timeout(1000)
-                        logger.info(f"Opened calendar for: {client_identifier}")
-                        return True
-
-            # Try clicking on any "0" link or the first clickable cell
-            zero_selectors = [
-                'a:has-text("0")',
-                'td a:has-text("0")',
-                'a[href*="calendar"]',
-                'td:nth-child(2) a',  # Days attend is often second column
-            ]
-
-            for selector in zero_selectors:
-                link = self.page.query_selector(selector)
-                if link:
-                    link.click()
-                    self.page.wait_for_load_state("networkidle")
-                    self.page.wait_for_timeout(1000)
-                    logger.info("Opened calendar view")
-                    return True
-
-            logger.error("Could not find days attend link")
-            return False
-
-        except Exception as e:
-            logger.error(f"Days attend click error: {str(e)}")
-            return False
-
-    def click_sessions_input(self, client_name: str = None) -> bool:
-        """
-        Click on the sessions/number input link for a client in the invoice.
-        This opens the calendar view for that client.
-
-        Args:
-            client_name: Optional client name to find specific row
-
-        Returns:
-            True if successfully clicked into calendar view
-        """
-        try:
-            logger.info("Looking for sessions input link...")
-
-            if client_name:
-                # Find row with client name
-                row = self.page.query_selector(f'tr:has-text("{client_name}")')
-                if row:
-                    # Click on sessions/number link in that row
-                    sessions_link = row.query_selector('a, input[type="text"], td:nth-child(2) a')
-                    if sessions_link:
-                        sessions_link.click()
-                        self.page.wait_for_load_state("networkidle")
-                        logger.info(f"Opened calendar for: {client_name}")
-                        return True
-
-            # Try generic session input selectors
-            session_selectors = [
-                'a:has-text("session")',
-                'a:has-text("Session")',
-                'td a',  # Links in table cells
-                '.session-link'
-            ]
-
-            for selector in session_selectors:
-                link = self.page.query_selector(selector)
-                if link:
-                    link.click()
-                    self.page.wait_for_load_state("networkidle")
-                    logger.info("Opened calendar view")
-                    return True
-
-            logger.error("Could not find sessions input link")
-            return False
-
-        except Exception as e:
-            logger.error(f"Sessions link error: {str(e)}")
-            return False
-
-    def enter_calendar_dates(self, service_dates: List[str], units: int = 1) -> bool:
-        """
-        Enter service units into calendar for specified dates.
-        Calendar shows eligible days - we input '1' (or units) into each service date.
-
-        Args:
-            service_dates: List of dates in MM/DD/YYYY format
-            units: Number to enter for each date (usually 1)
-
-        Returns:
-            True if dates entered successfully
-        """
-        try:
-            logger.info(f"Entering {len(service_dates)} service dates into calendar...")
-
-            for date_str in service_dates:
-                # Parse the date
-                parts = date_str.split('/')
-                if len(parts) == 3:
-                    month, day, year = parts
-                    day = str(int(day))  # Remove leading zeros for matching
-
-                    # Find the calendar cell for this date
-                    # Calendar cells typically have the day number or date as text/attribute
-                    date_selectors = [
-                        f'td:has-text("{day}") input',
-                        f'input[data-date="{date_str}"]',
-                        f'td[data-day="{day}"] input',
-                        f'//td[contains(text(),"{day}")]//input',
-                    ]
-
-                    for selector in date_selectors:
-                        try:
-                            if selector.startswith('//'):
-                                cell_input = self.page.query_selector(f'xpath={selector}')
-                            else:
-                                cell_input = self.page.query_selector(selector)
-
-                            if cell_input:
-                                cell_input.fill(str(units))
-                                logger.info(f"Entered {units} for date: {date_str}")
-                                break
-                        except:
-                            continue
-
+            logger.info("Clicking Update...")
+            self._js_click("Update")
+            self.page.wait_for_load_state("networkidle")
+            time.sleep(2)
+            logger.info("Update clicked")
             return True
-
         except Exception as e:
-            logger.error(f"Calendar entry error: {str(e)}")
+            logger.error(f"Update failed: {e}")
             return False
 
-    def submit_calendar(self, go_to_next: bool = False) -> bool:
+    def submit_billing_record(self, record: Dict) -> SubmissionResult:
         """
-        Submit the calendar entries.
-
-        Button options on calendar view:
-        - Update: Save and return to invoice list
-        - Update-next: Save and go to next client's calendar
-        - Close: Cancel without saving
+        Submit a single billing record to the portal.
 
         Args:
-            go_to_next: If True, click Update-next. If False, click Update.
+            record: Dictionary containing:
+                - uci: UCI number
+                - consumer_name: Consumer's name
+                - lastname, firstname: Name parts
+                - auth_number: Authorization number
+                - svc_code: Service code
+                - svc_subcode: Service subcode
+                - service_days: List of day numbers [3, 10, 17, ...]
+                - entered_units: Units per day (usually 1)
 
         Returns:
-            True if submitted successfully
+            SubmissionResult with success status
         """
         try:
-            if go_to_next:
-                logger.info("Clicking Update-next to continue to next calendar...")
-                btn_selectors = [
-                    'input[value="Update-next"]',
-                    'button:has-text("Update-next")',
-                    'input[value*="next" i]',
-                    'button:has-text("Next")',
-                ]
-            else:
-                logger.info("Clicking Update to save and return...")
-                btn_selectors = [
-                    'input[value="Update"]',
-                    'button:has-text("Update")',
-                    'input[type="submit"][value="Update"]',
-                ]
+            uci = record.get('uci', '')
+            consumer_name = record.get('consumer_name', '')
+            lastname = record.get('lastname', '')
+            svc_code = record.get('svc_code', '')
+            auth_number = record.get('auth_number', '')
+            service_days = record.get('service_days', [])
 
-            for selector in btn_selectors:
-                btn = self.page.query_selector(selector)
-                if btn:
-                    btn.click()
-                    self.page.wait_for_load_state("networkidle")
-                    self.page.wait_for_timeout(1000)
-                    logger.info("Calendar updated successfully")
-                    return True
+            logger.info(f"Processing: {consumer_name} (UCI: {uci})")
 
-            logger.error("Could not find Update button")
-            return False
+            # Open invoice details
+            if not self.open_invoice_details(lastname):
+                return SubmissionResult(
+                    success=False,
+                    consumer_name=consumer_name,
+                    uci=uci,
+                    error_message="Could not open invoice details"
+                )
 
-        except Exception as e:
-            logger.error(f"Calendar submit error: {str(e)}")
-            return False
+            # Open calendar
+            if not self.open_calendar(uci, svc_code, auth_number):
+                return SubmissionResult(
+                    success=False,
+                    consumer_name=consumer_name,
+                    uci=uci,
+                    error_message="Could not open calendar"
+                )
 
-    def close_calendar(self) -> bool:
-        """
-        Close calendar without saving (click Close button).
+            # Enter service days
+            days_entered = self.enter_calendar_units(service_days)
 
-        Returns:
-            True if closed successfully
-        """
-        try:
-            logger.info("Clicking Close to cancel...")
-            close_selectors = [
-                'input[value="Close"]',
-                'button:has-text("Close")',
-                'a:has-text("Close")',
-            ]
-
-            for selector in close_selectors:
-                btn = self.page.query_selector(selector)
-                if btn:
-                    btn.click()
-                    self.page.wait_for_load_state("networkidle")
-                    logger.info("Calendar closed")
-                    return True
-
-            logger.error("Could not find Close button")
-            return False
-
-        except Exception as e:
-            logger.error(f"Calendar close error: {str(e)}")
-            return False
-
-    def enter_service_line(
-        self,
-        client_name: str,
-        date_of_service: str,
-        cpt_code: str,
-        units: int,
-        charges: float,
-        provider_name: str
-    ) -> SubmissionResult:
-        """
-        Enter a single service line into the calendar interface.
-        NOTE: This is a legacy method - use the new flow methods instead:
-        click_invoice_edit() -> click_sessions_input() -> enter_calendar_dates() -> submit_calendar()
-
-        Args:
-            client_name: Patient/client full name
-            date_of_service: Date in MM/DD/YYYY format
-            cpt_code: CPT/service code
-            units: Number of units
-            charges: Dollar amount
-            provider_name: Rendering provider name
-
-        Returns:
-            SubmissionResult with success status and any confirmation
-        """
-        try:
-            logger.info(f"Entering service: {client_name} - {date_of_service} - {cpt_code}")
-
-            # Use the new calendar-based flow
-            if not self.click_sessions_input(client_name):
-                return SubmissionResult(success=False, error_message="Could not open calendar")
-
-            if not self.enter_calendar_dates([date_of_service], units):
-                return SubmissionResult(success=False, error_message="Could not enter date")
-
-            if not self.submit_calendar():
-                return SubmissionResult(success=False, error_message="Could not submit calendar")
+            # Click Update
+            if not self.click_update():
+                return SubmissionResult(
+                    success=False,
+                    consumer_name=consumer_name,
+                    uci=uci,
+                    days_entered=days_entered,
+                    error_message="Could not click Update"
+                )
 
             return SubmissionResult(
                 success=True,
-                confirmation_number="SUBMITTED",
-                error_message=None
+                consumer_name=consumer_name,
+                uci=uci,
+                days_entered=days_entered
             )
 
         except Exception as e:
-            logger.error(f"Service entry error: {str(e)}")
+            logger.error(f"Submission error: {e}")
             return SubmissionResult(
                 success=False,
+                consumer_name=record.get('consumer_name', ''),
+                uci=record.get('uci', ''),
                 error_message=str(e)
             )
 
-    def submit_invoice(self, claims: List[dict]) -> List[SubmissionResult]:
+    def submit_all_records(self, records: List[Dict], provider_name: str = "MY VOICE SPEECH") -> List[SubmissionResult]:
         """
-        Submit all claims to the eBilling portal.
+        Submit all billing records.
 
         Args:
-            claims: List of claim dictionaries from CSV parser
+            records: List of billing record dictionaries
+            provider_name: Name of the service provider
 
         Returns:
-            List of SubmissionResult for each claim
+            List of SubmissionResult objects
         """
         results = []
 
+        # Login
         if not self.login():
-            return [SubmissionResult(
-                success=False,
-                error_message="Login failed"
-            )]
+            return [SubmissionResult(success=False, error_message="Login failed")]
 
-        if not self.navigate_to_invoice_entry():
-            return [SubmissionResult(
-                success=False,
-                error_message="Navigation failed"
-            )]
+        # Select provider
+        if not self.select_provider(provider_name):
+            return [SubmissionResult(success=False, error_message="Provider selection failed")]
 
-        for claim in claims:
-            for line in claim.get('service_lines', []):
-                result = self.enter_service_line(
-                    client_name=claim.get('patient_name', ''),
-                    date_of_service=line.get('date_of_service', ''),
-                    cpt_code=line.get('cpt_code', ''),
-                    units=line.get('units', 1),
-                    charges=line.get('charges', 0),
-                    provider_name=line.get('provider_name', '')
-                )
-                results.append(result)
+        # Navigate to invoices
+        if not self.navigate_to_invoices():
+            return [SubmissionResult(success=False, error_message="Navigation failed")]
 
-                # Small delay between entries to avoid rate limiting
-                time.sleep(0.5)
+        # Process each record
+        for record in records:
+            result = self.submit_billing_record(record)
+            results.append(result)
+
+            if result.success:
+                logger.info(f"✓ Submitted: {result.consumer_name} ({result.days_entered} days)")
+            else:
+                logger.error(f"✗ Failed: {result.consumer_name} - {result.error_message}")
+
+            # Navigate back to invoice search for next record
+            try:
+                self.page.click('a:has-text("Invoices")', timeout=3000)
+                self.page.wait_for_load_state("networkidle")
+                self._js_click("Search")
+                self.page.wait_for_load_state("networkidle")
+                time.sleep(2)
+            except:
+                pass
 
         return results
 
-    def take_screenshot(self, name: str = "screenshot") -> str:
-        """Capture screenshot for debugging/confirmation"""
-        path = f"screenshots/{name}_{int(time.time())}.png"
-        self.page.screenshot(path=path)
-        logger.info(f"Screenshot saved: {path}")
-        return path
 
-    def test_connection(self) -> bool:
-        """Test if portal is reachable and credentials work"""
-        try:
-            self.start()
-            result = self.login()
-            return result
-        except Exception as e:
-            logger.error(f"Connection test failed: {str(e)}")
-            return False
-        finally:
-            self.stop()
-
-
-# Convenience function for quick submission
-def submit_to_ebilling(
-    username: str,
-    password: str,
-    claims: List[dict],
-    headless: bool = True
-) -> List[SubmissionResult]:
+def submit_to_ebilling(records: List[Dict], username: str, password: str,
+                       provider_name: str = "MY VOICE SPEECH",
+                       regional_center: str = "ELARC") -> List[SubmissionResult]:
     """
-    One-shot function to submit claims to DDS eBilling.
+    Convenience function to submit billing records.
 
     Args:
-        username: eBilling portal username
-        password: eBilling portal password
-        claims: List of claim dictionaries
-        headless: Run browser in headless mode
+        records: List of billing record dictionaries from CSV parser
+        username: Portal username
+        password: Portal password
+        provider_name: Service provider name
+        regional_center: Regional center code (ELARC, SGPRC)
 
     Returns:
-        List of SubmissionResult for each line item
+        List of SubmissionResult objects
     """
-    with DDSeBillingBot(username, password, headless) as bot:
-        return bot.submit_invoice(claims)
+    with DDSeBillingBot(username, password, headless=False, regional_center=regional_center) as bot:
+        return bot.submit_all_records(records, provider_name)
