@@ -257,18 +257,18 @@ class DDSeBillingBot:
             logger.error(f"Failed to open invoice details: {e}")
             return False
 
-    def open_calendar(self, uci: str, svc_code: str, auth_number: str) -> bool:
+    def open_calendar(self, uci: str, svc_code: str, svc_subcode: str, service_month: str) -> bool:
         """Click on Days Attend to open the calendar for a specific line"""
         try:
-            logger.info(f"Opening calendar for UCI: {uci}, SVC: {svc_code}, Auth: {auth_number}")
+            logger.info(f"Opening calendar for UCI: {uci}, SVC: {svc_code}, Subcode: {svc_subcode}, Month: {service_month}")
 
             # Find the matching row and click on Days Attend (the "0" cell)
             clicked = self.page.evaluate(f'''() => {{
                 const rows = document.querySelectorAll('tr');
                 for (const row of rows) {{
                     const text = row.innerText;
-                    // Match by UCI and SVC code
-                    if (text.includes('{uci}') && text.includes('{svc_code}')) {{
+                    // Match by UCI, SVC code, subcode, and service month
+                    if (text.includes('{uci}') && text.includes('{svc_code}') && text.includes('{svc_subcode}') && text.includes('{service_month}')) {{
                         const cells = row.querySelectorAll('td');
                         // Days Attend is usually around column 9-10, shows "0"
                         for (let i = 8; i < cells.length; i++) {{
@@ -430,7 +430,8 @@ class DDSeBillingBot:
             consumer_name = record.get('consumer_name', '')
             lastname = record.get('lastname', '')
             svc_code = record.get('svc_code', '')
-            auth_number = record.get('auth_number', '')
+            svc_subcode = record.get('svc_subcode', '')
+            service_month = record.get('service_month', '')
             service_days = record.get('service_days', [])
 
             logger.info(f"Processing: {consumer_name} (UCI: {uci})")
@@ -445,7 +446,7 @@ class DDSeBillingBot:
                 )
 
             # Open calendar
-            if not self.open_calendar(uci, svc_code, auth_number):
+            if not self.open_calendar(uci, svc_code, svc_subcode, service_month):
                 return SubmissionResult(
                     success=False,
                     consumer_name=consumer_name,
@@ -482,13 +483,13 @@ class DDSeBillingBot:
                 error_message=str(e)
             )
 
-    def submit_all_records(self, records: List[Dict], provider_name: str = "MY VOICE SPEECH") -> List[SubmissionResult]:
+    def submit_all_records(self, records: List[Dict], provider_name: str = None) -> List[SubmissionResult]:
         """
         Submit all billing records.
 
         Args:
             records: List of billing record dictionaries
-            provider_name: Name of the service provider
+            provider_name: Name of the service provider (if None, uses spn_id from first record)
 
         Returns:
             List of SubmissionResult objects
@@ -499,9 +500,15 @@ class DDSeBillingBot:
         if not self.login():
             return [SubmissionResult(success=False, error_message="Login failed")]
 
+        # Get provider from first record's spn_id if not specified
+        if not provider_name and records:
+            provider_name = records[0].get('spn_id', '')
+        if not provider_name:
+            return [SubmissionResult(success=False, error_message="No provider specified")]
+
         # Select provider
         if not self.select_provider(provider_name):
-            return [SubmissionResult(success=False, error_message="Provider selection failed")]
+            return [SubmissionResult(success=False, error_message=f"Provider selection failed: {provider_name}")]
 
         # Navigate to invoices
         if not self.navigate_to_invoices():
@@ -531,7 +538,7 @@ class DDSeBillingBot:
 
 
 def submit_to_ebilling(records: List[Dict], username: str, password: str,
-                       provider_name: str = "MY VOICE SPEECH",
+                       provider_name: str = None,
                        regional_center: str = "ELARC") -> List[SubmissionResult]:
     """
     Convenience function to submit billing records.
@@ -540,7 +547,7 @@ def submit_to_ebilling(records: List[Dict], username: str, password: str,
         records: List of billing record dictionaries from CSV parser
         username: Portal username
         password: Portal password
-        provider_name: Service provider name
+        provider_name: Service provider name (if None, uses spn_id from first record)
         regional_center: Regional center code (ELARC, SGPRC)
 
     Returns:
