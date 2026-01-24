@@ -10,25 +10,35 @@
                 <h4 class="mb-0">Upload Billing Data</h4>
             </div>
             <div class="card-body">
-                <p class="text-muted">
-                    Upload your Office Ally CSV export to process for Regional Center eBilling submission.
-                </p>
-
+                {% if not providers %}
+                <div class="alert alert-warning">
+                    <strong>No Regional Centers configured.</strong>
+                    <a href="{{ url_for('auth.settings') }}">Go to Settings</a> to add your eBilling credentials.
+                </div>
+                {% else %}
                 <form action="{{ url_for('main.upload_file') }}" method="post" enctype="multipart/form-data">
+                    <div class="mb-3">
+                        <label for="provider_id" class="form-label">Select Provider / Regional Center</label>
+                        <select class="form-select form-select-lg" id="provider_id" name="provider_id" required>
+                            <option value="">-- Select --</option>
+                            {% for p in providers %}
+                            <option value="{{ p.id }}">
+                                {{ p.name }} — {{ p.regional_center }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
                     <div class="mb-4">
                         <label for="file" class="form-label">Select CSV File</label>
                         <input type="file" class="form-control form-control-lg" id="file" name="file" accept=".csv" required>
-                        <div class="form-text">
-                            Accepts Office Ally CMS-1500 format CSV exports
-                        </div>
                     </div>
 
                     <div class="d-grid">
-                        <button type="submit" class="btn btn-primary btn-lg">
-                            Upload & Preview
-                        </button>
+                        <button type="submit" class="btn btn-primary btn-lg">Upload & Preview</button>
                     </div>
                 </form>
+                {% endif %}
             </div>
         </div>
 
@@ -38,10 +48,11 @@
             </div>
             <div class="card-body">
                 <ol class="mb-0">
-                    <li class="mb-2"><strong>Upload</strong> - Select your Office Ally CSV export</li>
-                    <li class="mb-2"><strong>Preview</strong> - Review parsed claims before submission</li>
-                    <li class="mb-2"><strong>Submit</strong> - Automation logs into DDS eBilling and enters claims</li>
-                    <li><strong>Track</strong> - Monitor submission status and confirmations</li>
+                    <li class="mb-2"><strong>Select</strong> - Choose your provider</li>
+                    <li class="mb-2"><strong>Upload</strong> - Select your billing CSV</li>
+                    <li class="mb-2"><strong>Preview</strong> - Review records before submission</li>
+                    <li class="mb-2"><strong>Submit</strong> - Automation enters data into eBilling</li>
+                    <li><strong>Download</strong> - Get a report of results</li>
                 </ol>
             </div>
         </div>

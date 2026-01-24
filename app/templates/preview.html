@@ -14,9 +14,18 @@
 </div>
 
 <div class="alert alert-info">
-    <strong>File:</strong> {{ filename }}
-    <br>
-    <small>Review the parsed data below. Click "Submit to eBilling" when ready.</small>
+    <div class="row">
+        <div class="col-md-4">
+            <strong>File:</strong> {{ filename }}
+        </div>
+        <div class="col-md-4">
+            <strong>Regional Center:</strong> <span class="badge bg-primary">{{ provider.regional_center }}</span> {{ provider.rc_name }}
+        </div>
+        <div class="col-md-4">
+            <strong>Provider:</strong> {{ provider.name }}
+        </div>
+    </div>
+    <small class="text-muted">Review the parsed data below. Click "Submit to eBilling" when ready.</small>
 </div>
 
 <div class="table-responsive">
@@ -36,25 +45,19 @@
         <tbody>
             {% for record in claims %}
             <tr>
-                <td>
-                    <strong>{{ record.consumer_name_display }}</strong>
-                </td>
+                <td><strong>{{ record.consumer_name_display }}</strong></td>
                 <td><code>{{ record.uci }}</code></td>
                 <td>{{ record.auth_number }}</td>
                 <td>
                     <code>{{ record.svc_code }}</code>
-                    {% if record.svc_subcode %}
-                    / <code>{{ record.svc_subcode }}</code>
-                    {% endif %}
+                    {% if record.svc_subcode %}/ <code>{{ record.svc_subcode }}</code>{% endif %}
                 </td>
                 <td>{{ record.service_month }}</td>
                 <td>
                     <span class="badge bg-info">{{ record.days_count }} days</span>
                     <br>
                     <small class="text-muted">
-                        {% for day in record.service_days %}
-                            {{ day }}{% if not loop.last %}, {% endif %}
-                        {% endfor %}
+                        {% for day in record.service_days %}{{ day }}{% if not loop.last %}, {% endif %}{% endfor %}
                     </small>
                 </td>
                 <td>{{ record.entered_units }}</td>
@@ -96,6 +99,7 @@
 {% block scripts %}
 <script>
 const claimsData = {{ claims|tojson|safe }};
+const providerId = {{ provider.id }};
 
 async function submitClaims() {
     const btn = document.getElementById('submitBtn');
@@ -108,10 +112,11 @@ async function submitClaims() {
     try {
         const response = await fetch('{{ url_for("main.submit_claims") }}', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ claims: claimsData })
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                claims: claimsData,
+                provider_id: providerId
+            })
         });
 
         const result = await response.json();
@@ -129,16 +134,42 @@ async function submitClaims() {
         status.classList.add('alert-success');
 
         let detailsHtml = '';
-        if (result.results) {
-            detailsHtml = '<ul class="mt-2 mb-0">';
+        if (result.results && result.results.length > 0) {
+            detailsHtml = `
+                <div class="table-responsive mt-3">
+                    <table class="table table-sm">
+                        <thead class="table-dark">
+                            <tr>
+                                <th>Status</th>
+                                <th>Consumer</th>
+                                <th>UCI</th>
+                                <th>SVC Code</th>
+                                <th>Month</th>
+                                <th>Days</th>
+                                <th>Error</th>
+                            </tr>
+                        </thead>
+                        <tbody>`;
+
             result.results.forEach(r => {
+                const rowClass = r.success ? 'table-success' : 'table-danger';
                 const icon = r.success ? '✓' : '✗';
-                const text = r.success
-                    ? `${r.consumer_name} - ${r.days_entered} days entered`
-                    : `${r.consumer_name} - ${r.error}`;
-                detailsHtml += `<li>${icon} ${text}</li>`;
+                const days = r.service_days ? r.service_days.join(', ') : (r.days_entered + ' days');
+                const svcCode = (r.svc_code || '') + (r.svc_subcode ? '/' + r.svc_subcode : '');
+
+                detailsHtml += `
+                    <tr class="${rowClass}">
+                        <td><strong>${icon}</strong></td>
+                        <td>${r.consumer_name || ''}</td>
+                        <td><code>${r.uci || ''}</code></td>
+                        <td><code>${svcCode}</code></td>
+                        <td>${r.service_month || ''}</td>
+                        <td>${days}</td>
+                        <td>${r.error || ''}</td>
+                    </tr>`;
             });
-            detailsHtml += '</ul>';
+
+            detailsHtml += '</tbody></table></div>';
         }
 
         status.innerHTML = `

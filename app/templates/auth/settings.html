@@ -1,77 +1,136 @@
 {% extends "base.html" %}
 
-{% block title %}Clinic Settings{% endblock %}
+{% block title %}Settings{% endblock %}
 
 {% block content %}
 <div class="row">
-    <div class="col-md-8 offset-md-2">
-        <h2 class="mb-4">Clinic Settings</h2>
+    <div class="col-md-10 offset-md-1">
+        <h2 class="mb-4">Settings</h2>
 
+        <!-- Add Provider -->
         <div class="card mb-4">
-            <div class="card-header">
-                <h5 class="mb-0">eBilling Configuration</h5>
+            <div class="card-header bg-primary text-white">
+                <h5 class="mb-0">Add Provider</h5>
             </div>
             <div class="card-body">
-                <form method="POST">
-                    <div class="row">
-                        <div class="col-md-6 mb-3">
-                            <label for="regional_center" class="form-label">Regional Center</label>
-                            <select class="form-select" id="regional_center" name="regional_center">
-                                {% for rc in regional_centers %}
-                                <option value="{{ rc }}" {% if current_user.regional_center == rc %}selected{% endif %}>
-                                    {{ rc }}
-                                </option>
+                <form method="POST" action="{{ url_for('auth.add_provider') }}">
+                    <div class="row g-3">
+                        <div class="col-md-3">
+                            <label class="form-label">Provider Name</label>
+                            <input type="text" class="form-control" name="name" placeholder="MY SPEECH THERAPY INC" required>
+                        </div>
+                        <div class="col-md-3">
+                            <label class="form-label">Regional Center</label>
+                            <select class="form-select" name="regional_center" required>
+                                <option value="">-- Select RC --</option>
+                                {% for code, (name, url) in regional_centers.items() %}
+                                <option value="{{ code }}">{{ code }} - {{ name }}</option>
                                 {% endfor %}
                             </select>
                         </div>
-                        <div class="col-md-6 mb-3">
-                            <label for="provider_name" class="form-label">Provider Name</label>
-                            <input type="text" class="form-control" id="provider_name" name="provider_name"
-                                   value="{{ current_user.provider_name }}"
-                                   placeholder="e.g., MY VOICE SPEECH">
-                            <small class="text-muted">Must match exactly as shown in eBilling portal</small>
+                        <div class="col-md-2">
+                            <label class="form-label">Username</label>
+                            <input type="text" class="form-control" name="username" placeholder="username">
+                        </div>
+                        <div class="col-md-2">
+                            <label class="form-label">Password</label>
+                            <input type="password" class="form-control" name="password" placeholder="password">
+                        </div>
+                        <div class="col-md-2 d-flex align-items-end">
+                            <button type="submit" class="btn btn-primary w-100">Add</button>
                         </div>
                     </div>
-
-                    <hr>
-                    <h6>eBilling Portal Credentials</h6>
-
-                    <div class="row">
-                        <div class="col-md-6 mb-3">
-                            <label for="ebilling_username" class="form-label">eBilling Username</label>
-                            <input type="text" class="form-control" id="ebilling_username" name="ebilling_username"
-                                   value="{{ eb_username }}">
-                        </div>
-                        <div class="col-md-6 mb-3">
-                            <label for="ebilling_password" class="form-label">eBilling Password</label>
-                            <input type="password" class="form-control" id="ebilling_password" name="ebilling_password"
-                                   placeholder="{% if eb_username %}(unchanged){% else %}Enter password{% endif %}">
-                            <small class="text-muted">Leave blank to keep existing password</small>
-                        </div>
-                    </div>
-
-                    <button type="submit" class="btn btn-primary">Save Settings</button>
                 </form>
             </div>
         </div>
 
-        <div class="card">
+        <!-- Existing Providers -->
+        {% if providers %}
+        <div class="card mb-4">
             <div class="card-header">
-                <h5 class="mb-0">Account Info</h5>
+                <h5 class="mb-0">Your Providers</h5>
             </div>
             <div class="card-body">
-                <p><strong>Clinic:</strong> {{ current_user.clinic_name }}</p>
-                <p><strong>Email:</strong> {{ current_user.email }}</p>
-                <p><strong>Subscription Status:</strong>
-                    {% if current_user.is_subscription_active %}
-                    <span class="badge bg-success">Active</span>
-                    {% else %}
-                    <span class="badge bg-danger">Inactive</span>
-                    {% endif %}
-                </p>
-                {% if current_user.subscription_end %}
-                <p><strong>Expires:</strong> {{ current_user.subscription_end.strftime('%B %d, %Y') }}</p>
-                {% endif %}
+                <div class="table-responsive">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>Provider Name</th>
+                                <th>Regional Center</th>
+                                <th>Username</th>
+                                <th>Password</th>
+                                <th>Updated</th>
+                                <th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for p in providers %}
+                            <tr>
+                                <td><strong>{{ p.name }}</strong></td>
+                                <td>
+                                    <span class="badge bg-info">{{ p.regional_center }}</span>
+                                    <br><small class="text-muted">{{ p.rc_name }}</small>
+                                </td>
+                                <td><code>{{ p.username or '(not set)' }}</code></td>
+                                <td>
+                                    {% if p.password_encrypted %}
+                                    <span class="text-success">Set</span>
+                                    {% else %}
+                                    <span class="text-danger">Not set</span>
+                                    {% endif %}
+                                </td>
+                                <td><small>{{ p.updated_at.strftime('%m/%d/%y') if p.updated_at else '-' }}</small></td>
+                                <td class="text-end">
+                                    <button class="btn btn-sm btn-outline-primary" type="button"
+                                            data-bs-toggle="collapse" data-bs-target="#edit{{ p.id }}">
+                                        Edit
+                                    </button>
+                                    <form method="POST" action="{{ url_for('auth.delete_provider', provider_id=p.id) }}" style="display:inline">
+                                        <button type="submit" class="btn btn-sm btn-outline-danger" onclick="return confirm('Delete {{ p.name }}?')">Delete</button>
+                                    </form>
+                                </td>
+                            </tr>
+                            <tr class="collapse" id="edit{{ p.id }}">
+                                <td colspan="6" class="bg-light">
+                                    <form method="POST" action="{{ url_for('auth.update_provider', provider_id=p.id) }}" class="row g-2 p-2">
+                                        <div class="col-md-3">
+                                            <input type="text" class="form-control form-control-sm" name="name" value="{{ p.name }}" placeholder="Provider Name">
+                                        </div>
+                                        <div class="col-md-3">
+                                            <select class="form-select form-select-sm" name="regional_center">
+                                                {% for code, (name, url) in regional_centers.items() %}
+                                                <option value="{{ code }}" {% if code == p.regional_center %}selected{% endif %}>{{ code }}</option>
+                                                {% endfor %}
+                                            </select>
+                                        </div>
+                                        <div class="col-md-2">
+                                            <input type="text" class="form-control form-control-sm" name="username" value="{{ p.username or '' }}" placeholder="Username">
+                                        </div>
+                                        <div class="col-md-2">
+                                            <input type="password" class="form-control form-control-sm" name="password" placeholder="New Password">
+                                        </div>
+                                        <div class="col-md-2">
+                                            <button type="submit" class="btn btn-sm btn-success w-100">Save</button>
+                                        </div>
+                                    </form>
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+
+        <!-- Account -->
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0">Account</h5>
+            </div>
+            <div class="card-body">
+                <p><strong>Name:</strong> {{ current_user.name }}</p>
+                <p><strong>Username:</strong> {{ current_user.email }}</p>
             </div>
         </div>
     </div>
