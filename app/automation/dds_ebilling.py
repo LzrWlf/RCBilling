@@ -18,13 +18,17 @@ Portal Flow:
 """
 from playwright.sync_api import sync_playwright, Page, Browser
 from dataclasses import dataclass
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
+from collections import defaultdict
 import logging
 import time
 import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Read headless mode from environment (default True for production)
+PLAYWRIGHT_HEADLESS = os.environ.get('PLAYWRIGHT_HEADLESS', 'true').lower() == 'true'
 
 # Create screenshots directory for debugging
 SCREENSHOT_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'screenshots')
@@ -41,9 +45,13 @@ RC_PORTAL_URLS = {
 class SubmissionResult:
     """Result of a billing submission"""
     success: bool
+    partial: bool = False  # True if some days entered but not all
     consumer_name: str = ""
     uci: str = ""
     days_entered: int = 0
+    days_expected: int = 0  # Total days expected from CSV
+    unavailable_days: List[int] = None  # Days that were greyed out/disabled
+    already_entered_days: List[int] = None  # Days that already had values (skipped)
     error_message: Optional[str] = None
     # Billing data from RC portal (captured after update)
     rc_units_billed: float = 0.0
@@ -60,11 +68,12 @@ class DDSeBillingBot:
     Automation bot for DDS eBilling portal.
     """
 
-    def __init__(self, username: str, password: str, headless: bool = False,
+    def __init__(self, username: str, password: str, headless: bool = None,
                  regional_center: str = 'ELARC', portal_url: str = None):
         self.username = username
         self.password = password
-        self.headless = headless
+        # Use provided value, or fall back to environment setting
+        self.headless = headless if headless is not None else PLAYWRIGHT_HEADLESS
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
         self.context = None
@@ -91,12 +100,12 @@ class DDSeBillingBot:
 
     def start(self):
         """Start browser session"""
-        logger.info("Starting browser...")
+        logger.info(f"Starting browser (headless={self.headless})...")
         self.playwright = sync_playwright().start()
+        # Use bundled Chromium (no channel) for Docker/production compatibility
         self.browser = self.playwright.chromium.launch(
             headless=self.headless,
-            channel='chrome',
-            args=['--disable-blink-features=AutomationControlled']
+            args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
         )
         self.context = self.browser.new_context()
         self.page = self.context.new_page()
@@ -369,6 +378,53 @@ class DDSeBillingBot:
             self._screenshot("error_login_exception")
             return False
 
+    def select_first_provider(self) -> bool:
+        """Select the first available provider in the list"""
+        try:
+            logger.info("Selecting first available provider...")
+            self._screenshot("05_provider_selection")
+
+            # Look for provider table specifically - it has Service Provider # column
+            result = self.page.evaluate('''() => {
+                // Find table rows that look like provider entries (have SPN ID pattern like HP1234, PP1234)
+                const rows = document.querySelectorAll('tr');
+                for (const row of rows) {
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length >= 2) {
+                        const firstCellText = cells[0]?.innerText?.trim() || '';
+                        // SPN IDs typically start with 2 letters followed by numbers (e.g., HP0197, PP0212)
+                        if (/^[A-Za-z]{2}\d+$/.test(firstCellText)) {
+                            row.click();
+                            return 'clicked provider: ' + firstCellText;
+                        }
+                    }
+                }
+                // Fallback: click first data row with 2+ cells
+                for (const row of rows) {
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length >= 2) {
+                        row.click();
+                        return 'clicked first data row';
+                    }
+                }
+                return false;
+            }''')
+
+            if result:
+                logger.info(f"Provider selection: {result}")
+                time.sleep(2)
+                self._js_click("OK")
+                self.page.wait_for_load_state("networkidle")
+                time.sleep(2)
+                self._screenshot("06_after_provider_select")
+                logger.info("First provider selected")
+                return True
+            logger.warning("No provider rows found")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to select first provider: {e}")
+            return False
+
     def select_provider(self, provider_identifier: str) -> bool:
         """Select the service provider by SPN ID or name"""
         try:
@@ -421,25 +477,23 @@ class DDSeBillingBot:
                     if clicked:
                         logger.info(f"Selected provider by numeric match: {numeric_part}")
 
-            # Method 2: Fall back to provider name text match
+            # Method 3: Fall back to provider name text match (case-insensitive)
             if not clicked:
+                # Escape special characters for JavaScript string
+                safe_identifier = provider_identifier.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
                 clicked = self.page.evaluate(f'''() => {{
+                    const searchTerm = '{safe_identifier}'.toLowerCase();
                     const rows = document.querySelectorAll('tr');
                     for (const row of rows) {{
-                        if (row.innerText.includes('{provider_identifier}')) {{
-                            row.click();
-                            return true;
-                        }}
-                    }}
-                    // If exact match not found, try partial match
-                    for (const row of rows) {{
-                        if (row.innerText.toLowerCase().includes('{provider_identifier}'.toLowerCase())) {{
+                        if (row.innerText.toLowerCase().includes(searchTerm)) {{
                             row.click();
                             return true;
                         }}
                     }}
                     return false;
                 }}''')
+                if clicked:
+                    logger.info(f"Selected provider by name match: {provider_identifier}")
 
             if not clicked:
                 logger.error(f"Provider '{provider_identifier}' not found")
@@ -549,30 +603,74 @@ class DDSeBillingBot:
             self._screenshot("error_navigation")
             return False
 
+    def _debug_page_structure(self):
+        """Debug helper to understand page structure"""
+        info = self.page.evaluate('''() => {
+            const tables = document.querySelectorAll('table');
+            const iframes = document.querySelectorAll('iframe');
+            const allTrs = document.querySelectorAll('tr');
+
+            let tableInfo = [];
+            tables.forEach((t, i) => {
+                const rows = t.querySelectorAll('tr').length;
+                const text = t.innerText.substring(0, 100);
+                tableInfo.push({index: i, rows: rows, preview: text});
+            });
+
+            return {
+                tableCount: tables.length,
+                iframeCount: iframes.length,
+                totalTrCount: allTrs.length,
+                tables: tableInfo,
+                bodyText: document.body.innerText.substring(0, 500)
+            };
+        }''')
+        logger.info(f"Page structure: {info}")
+        return info
+
     def cache_invoice_search_results(self) -> list:
         """
         Scrape invoice search results table and return list of invoice info.
-        Returns list of dicts: {invoice_id, svc_code, svc_month, uci, consumer_name, row_index}
+        Portal uses unusual structure: each invoice row is in its own <table>.
         """
         try:
             invoices = self.page.evaluate('''() => {
                 const results = [];
-                const rows = document.querySelectorAll('tr');
                 let rowIndex = 0;
 
-                for (const row of rows) {
-                    const cells = row.querySelectorAll('td');
-                    if (cells.length < 5) continue;  // Skip header/empty rows
+                // Portal quirk: each invoice row is in its own <table>
+                // Scan ALL tables looking for rows that match invoice pattern
+                const tables = document.querySelectorAll('table');
 
-                    // Table columns: Invoice #, Service Code, Service M/Y, UCI#, Consumer Name, ...
-                    const invoiceId = cells[0]?.innerText?.trim() || '';
-                    const svcCode = cells[1]?.innerText?.trim() || '';
-                    const svcMonth = cells[2]?.innerText?.trim() || '';
-                    const uci = cells[3]?.innerText?.trim() || '';
-                    const consumerName = cells[4]?.innerText?.trim() || '';
+                for (const table of tables) {
+                    const rows = table.querySelectorAll('tr');
 
-                    // Skip if no invoice ID (likely header row)
-                    if (invoiceId && /^\d+$/.test(invoiceId)) {
+                    for (const row of rows) {
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length < 6) continue;
+
+                        // First cell with content should be Invoice# (7-digit number)
+                        // Find the first non-empty cell that looks like an invoice ID
+                        let invoiceId = '';
+                        let dataStartIdx = 0;
+
+                        for (let i = 0; i < Math.min(cells.length, 3); i++) {
+                            const text = cells[i]?.innerText?.trim() || '';
+                            if (/^\\d{6,8}$/.test(text)) {
+                                invoiceId = text;
+                                dataStartIdx = i;
+                                break;
+                            }
+                        }
+
+                        if (!invoiceId) continue;
+
+                        // Extract data relative to where we found the invoice ID
+                        const svcCode = cells[dataStartIdx + 1]?.innerText?.trim() || '';
+                        const svcMonth = cells[dataStartIdx + 2]?.innerText?.trim() || '';
+                        const uci = cells[dataStartIdx + 3]?.innerText?.trim() || '';
+                        const consumerName = cells[dataStartIdx + 4]?.innerText?.trim() || '';
+
                         results.push({
                             invoice_id: invoiceId,
                             svc_code: svcCode,
@@ -582,9 +680,10 @@ class DDSeBillingBot:
                             row_index: rowIndex,
                             has_uci: uci.length > 0
                         });
+                        rowIndex++;
                     }
-                    rowIndex++;
                 }
+
                 return results;
             }''')
 
@@ -596,6 +695,219 @@ class DDSeBillingBot:
 
         except Exception as e:
             logger.error(f"Failed to cache invoice search results: {e}")
+            return []
+
+    def _click_next_page(self) -> bool:
+        """Click next page button if available, return True if successful"""
+        try:
+            # Try common pagination patterns
+            result = self.page.evaluate('''() => {
+                // Look for Next button or > arrow
+                const nextSelectors = [
+                    'a:contains("Next")', 'input[value="Next"]', 'button:contains("Next")',
+                    'a:contains(">")', 'button:contains(">")',
+                    '[class*="next"]', '[aria-label*="next" i]',
+                    'a.next', 'li.next a'
+                ];
+
+                // Try each selector
+                for (const sel of nextSelectors) {
+                    try {
+                        const el = document.querySelector(sel);
+                        if (el && !el.disabled && el.offsetParent !== null) {
+                            el.click();
+                            return true;
+                        }
+                    } catch(e) {}
+                }
+
+                // Try finding by text content
+                const links = document.querySelectorAll('a, button, input[type="button"]');
+                for (const link of links) {
+                    const text = (link.value || link.innerText || '').trim();
+                    if (text === 'Next' || text === '>' || text === '>>') {
+                        if (!link.disabled && link.offsetParent !== null) {
+                            link.click();
+                            return true;
+                        }
+                    }
+                }
+
+                return false;
+            }''')
+
+            if result:
+                time.sleep(2)
+                self.page.wait_for_load_state("networkidle")
+                return True
+            return False
+
+        except Exception as e:
+            logger.debug(f"No next page: {e}")
+            return False
+
+    def scrape_all_invoice_pages(self) -> List[Dict]:
+        """
+        Scrape ALL invoice search results, handling pagination.
+        Returns complete list of available invoices on the portal.
+        """
+        all_invoices = []
+        page_num = 1
+        max_pages = 50  # Safety limit
+
+        while page_num <= max_pages:
+            # Debug: Log page structure before scraping (first page only)
+            if page_num == 1:
+                self._debug_page_structure()
+
+            # Scrape current page
+            page_invoices = self.cache_invoice_search_results()
+
+            if not page_invoices:
+                break
+
+            # Check for duplicates (indicates we've looped back)
+            if all_invoices and page_invoices:
+                first_new_id = page_invoices[0].get('invoice_id', '')
+                if any(inv.get('invoice_id') == first_new_id for inv in all_invoices):
+                    logger.info("Detected duplicate invoices, stopping pagination")
+                    break
+
+            all_invoices.extend(page_invoices)
+            logger.info(f"Page {page_num}: Found {len(page_invoices)} invoices (total: {len(all_invoices)})")
+
+            # Try to go to next page
+            if not self._click_next_page():
+                logger.info("No more pages available")
+                break
+
+            page_num += 1
+            time.sleep(1)
+
+        logger.info(f"=== Invoice Inventory Complete: {len(all_invoices)} invoices across {page_num} page(s) ===")
+        return all_invoices
+
+    def _normalize_month(self, month_str: str) -> str:
+        """Normalize month format: '8/2025' -> '08/2025'"""
+        if not month_str:
+            return ''
+        parts = month_str.split('/')
+        if len(parts) == 2:
+            return parts[0].zfill(2) + '/' + parts[1]
+        return month_str
+
+    def match_records_to_inventory(
+        self,
+        records: List[Dict],
+        inventory: List[Dict]
+    ) -> Tuple[List[Dict], List[Dict]]:
+        """
+        Match CSV records against portal inventory.
+
+        Returns:
+            (matchable_records, unmatched_records)
+            Each unmatched record includes 'skip_reason' field
+        """
+        matchable = []
+        unmatched = []
+
+        # Create lookup structures for efficient matching
+        # Key: (svc_code, normalized_month) -> list of inventory items
+        inventory_by_key = defaultdict(list)
+        for inv in inventory:
+            key = (inv.get('svc_code', ''), self._normalize_month(inv.get('svc_month', '')))
+            inventory_by_key[key].append(inv)
+
+        # Also create UCI lookup for direct matches
+        inventory_by_uci = {}
+        for inv in inventory:
+            uci = inv.get('uci', '')
+            if uci:
+                month = self._normalize_month(inv.get('svc_month', ''))
+                inventory_by_uci[(uci, month)] = inv
+
+        for record in records:
+            svc_code = record.get('svc_code', '')
+            service_month = self._normalize_month(record.get('service_month', ''))
+            uci = record.get('uci', '')
+            consumer_name = record.get('consumer_name', '')
+
+            # Method 1: Direct UCI + month match
+            if (uci, service_month) in inventory_by_uci:
+                matchable.append(record)
+                logger.debug(f"  ✓ Direct match: {consumer_name} (UCI: {uci})")
+                continue
+
+            # Method 2: Check by service code + month (for multi-consumer invoices)
+            key = (svc_code, service_month)
+            matching_invoices = inventory_by_key.get(key, [])
+
+            if not matching_invoices:
+                # No invoice for this service code + month
+                record['skip_reason'] = f"No invoice found for SVC {svc_code}, Month {service_month}"
+                unmatched.append(record)
+                logger.debug(f"  ✗ No invoice: {consumer_name} - {record['skip_reason']}")
+                continue
+
+            # Check for multi-consumer invoice (empty UCI means it could contain this consumer)
+            found_multi_consumer = False
+            for inv in matching_invoices:
+                if not inv.get('has_uci', True):  # Empty UCI = multi-consumer invoice
+                    found_multi_consumer = True
+                    record['_is_multi_consumer'] = True
+                    break
+
+            if found_multi_consumer:
+                matchable.append(record)
+                logger.debug(f"  ✓ Multi-consumer match: {consumer_name} (UCI: {uci})")
+            else:
+                # Invoice exists but UCI not in it
+                record['skip_reason'] = f"UCI {uci} not found in available invoices for SVC {svc_code}, Month {service_month}"
+                unmatched.append(record)
+                logger.debug(f"  ✗ UCI not found: {consumer_name} - {record['skip_reason']}")
+
+        logger.info(f"Matching complete: {len(matchable)} matchable, {len(unmatched)} unmatched")
+        return matchable, unmatched
+
+    def expand_multi_consumer_folder(self, folder_inv: Dict) -> List[Dict]:
+        """
+        Click into a multi-consumer invoice folder and scrape individual invoices inside.
+        Returns list of individual consumer invoice records.
+        """
+        try:
+            svc_code = folder_inv.get('svc_code', '')
+            svc_month = folder_inv.get('svc_month', '')
+            invoice_id = folder_inv.get('invoice_id', '')
+
+            logger.info(f"Expanding folder: Invoice {invoice_id}, SVC={svc_code}, Month={svc_month}")
+
+            # Click EDIT on this folder row to open it
+            if not self.open_invoice_details(None, service_month_year=svc_month, svc_code=svc_code):
+                logger.warning(f"Could not open folder {invoice_id}")
+                return []
+
+            # Now we're in the invoice view - scrape consumer lines
+            # Uses existing cache_multi_consumer_invoice_contents() method
+            consumers = self.cache_multi_consumer_invoice_contents(svc_code, svc_month)
+
+            # Convert to inventory format
+            invoices = []
+            for c in consumers:
+                name_parts = c.get('consumer_name', '').split(',')
+                invoices.append({
+                    'invoice_id': invoice_id,
+                    'last_name': name_parts[0].strip() if name_parts else '',
+                    'first_name': name_parts[1].strip() if len(name_parts) > 1 else '',
+                    'uci': c.get('uci', ''),
+                    'service_month': svc_month,
+                    'svc_code': c.get('svc_code', svc_code)
+                })
+
+            logger.info(f"  Found {len(invoices)} consumers in folder")
+            return invoices
+
+        except Exception as e:
+            logger.error(f"Error expanding folder: {e}")
             return []
 
     def cache_multi_consumer_invoice_contents(self, svc_code: str, svc_month_year: str) -> List[Dict]:
@@ -623,16 +935,28 @@ class DDSeBillingBot:
                     const cells = row.querySelectorAll('td');
                     if (cells.length < 6) continue;  // Skip header/insufficient rows
 
-                    // Invoice view columns: Line#, Consumer, UCI#, SVC Code, SVC Subcode, Auth#, ...
-                    const lineNum = cells[0]?.innerText?.trim() || '';
-                    const consumerName = cells[1]?.innerText?.trim() || '';
-                    const uci = cells[2]?.innerText?.trim() || '';
-                    const svcCode = cells[3]?.innerText?.trim() || '';
-                    const svcSubcode = cells[4]?.innerText?.trim() || '';
-                    const authNumber = cells[5]?.innerText?.trim() || '';
+                    // Invoice view columns: [0]Checkbox, [1]Line#, [2]Consumer, [3]UCI#, [4]SVC Code, [5]SVC Subcode, [6]Auth#, ...
+                    // Find Line# column - it's a small integer (1, 2, 3...)
+                    let lineIdx = -1;
+                    for (let i = 0; i < Math.min(cells.length, 3); i++) {
+                        const text = cells[i]?.innerText?.trim() || '';
+                        if (/^\\d{1,3}$/.test(text) && parseInt(text) < 100) {
+                            lineIdx = i;
+                            break;
+                        }
+                    }
 
-                    // Skip header row (Line# would be non-numeric)
-                    if (lineNum && /^\\d+$/.test(lineNum)) {
+                    if (lineIdx === -1) continue;
+
+                    const lineNum = cells[lineIdx]?.innerText?.trim() || '';
+                    const consumerName = cells[lineIdx + 1]?.innerText?.trim() || '';
+                    const uci = cells[lineIdx + 2]?.innerText?.trim() || '';
+                    const svcCode = cells[lineIdx + 3]?.innerText?.trim() || '';
+                    const svcSubcode = cells[lineIdx + 4]?.innerText?.trim() || '';
+                    const authNumber = cells[lineIdx + 5]?.innerText?.trim() || '';
+
+                    // Validate: UCI should be a number, consumer name should have letters
+                    if (lineNum && /^\\d+$/.test(lineNum) && /^\\d+$/.test(uci) && /[a-zA-Z]/.test(consumerName)) {
                         results.push({
                             line_number: parseInt(lineNum),
                             consumer_name: consumerName,
@@ -686,12 +1010,12 @@ class DDSeBillingBot:
                     const rows = document.querySelectorAll('tr');
                     for (const row of rows) {{
                         const cells = row.querySelectorAll('td');
-                        if (cells.length < 5) continue;
+                        if (cells.length < 6) continue;
 
-                        // Table: Invoice#, Service Code, Service M/Y, UCI#, Consumer Name, ...
-                        const rowSvcCode = cells[1]?.innerText?.trim() || '';
-                        const rowMonth = normalizeMonth(cells[2]?.innerText?.trim() || '');
-                        const rowUci = cells[3]?.innerText?.trim() || '';
+                        // Table: [0]Checkbox, [1]Invoice#, [2]Service Code, [3]Service M/Y, [4]UCI#, [5]Consumer Name, ...
+                        const rowSvcCode = cells[2]?.innerText?.trim() || '';
+                        const rowMonth = normalizeMonth(cells[3]?.innerText?.trim() || '');
+                        const rowUci = cells[4]?.innerText?.trim() || '';
 
                         // Match all three: UCI, Service Code, Service M/Y
                         const matchesUci = rowUci === '{uci}';
@@ -735,11 +1059,12 @@ class DDSeBillingBot:
                     const rows = document.querySelectorAll('tr');
                     for (const row of rows) {{
                         const cells = row.querySelectorAll('td');
-                        if (cells.length < 5) continue;
+                        if (cells.length < 6) continue;
 
-                        const rowSvcCode = cells[1]?.innerText?.trim() || '';
-                        const rowMonth = normalizeMonth(cells[2]?.innerText?.trim() || '');
-                        const rowUci = cells[3]?.innerText?.trim() || '';
+                        // Table: [0]Checkbox, [1]Invoice#, [2]Service Code, [3]Service M/Y, [4]UCI#, [5]Consumer Name, ...
+                        const rowSvcCode = cells[2]?.innerText?.trim() || '';
+                        const rowMonth = normalizeMonth(cells[3]?.innerText?.trim() || '');
+                        const rowUci = cells[4]?.innerText?.trim() || '';
 
                         // Multi-consumer: UCI is empty, but Service Code + Month match
                         const isMultiConsumer = !rowUci || rowUci === '';
@@ -899,19 +1224,26 @@ class DDSeBillingBot:
             logger.error(f"Failed to enter service days: {e}")
             return False
 
-    def enter_calendar_units(self, service_days: List[int], units_per_day: int = 1) -> int:
-        """Enter units in calendar input fields for specified days"""
+    def enter_calendar_units(self, service_days: List[int], units_per_day: int = 1) -> Tuple[int, List[int], List[int]]:
+        """
+        Enter units in calendar input fields for specified days.
+        Detects disabled/greyed-out inputs and inputs that already have values.
+
+        Returns:
+            Tuple of (days_entered, unavailable_days, already_entered_days)
+            - days_entered: count of successfully entered days
+            - unavailable_days: list of day numbers that were greyed out/disabled
+            - already_entered_days: list of day numbers that already had values (skipped to prevent overwrite)
+        """
         try:
             logger.info(f"Entering {units_per_day} unit(s) for days: {service_days}")
 
             days_entered = 0
+            unavailable_days = []
+            already_entered_days = []
 
-            # Get all input fields in the calendar
-            # The calendar structure has day numbers with input fields below them
             for day in service_days:
                 try:
-                    # Find and fill the input for this day
-                    # Calendar inputs are in table cells, day number is visible text
                     result = self.page.evaluate(f'''() => {{
                         // Look through all table cells
                         const cells = document.querySelectorAll('td');
@@ -924,31 +1256,54 @@ class DDSeBillingBot:
                                 // Make sure it's the right day (not just contains the digit)
                                 const lines = text.split('\\n');
                                 if (lines[0].trim() === '{day}') {{
+                                    // Check if input is disabled/readonly/greyed-out
+                                    if (input.disabled || input.readOnly ||
+                                        input.getAttribute('disabled') !== null ||
+                                        input.getAttribute('readonly') !== null ||
+                                        cell.classList.contains('disabled') ||
+                                        getComputedStyle(input).pointerEvents === 'none' ||
+                                        parseFloat(getComputedStyle(input).opacity) < 0.5) {{
+                                        return 'disabled';
+                                    }}
+                                    // Check if already has a value (prevent overwrite)
+                                    const existingValue = parseFloat(input.value) || 0;
+                                    if (existingValue > 0) {{
+                                        return 'already_entered';
+                                    }}
+                                    // Enter value
                                     input.value = '{units_per_day}';
                                     input.dispatchEvent(new Event('input', {{ bubbles: true }}));
                                     input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                                    return true;
+                                    return 'success';
                                 }}
                             }}
                         }}
-                        return false;
+                        return 'not_found';
                     }}''')
 
-                    if result:
+                    if result == 'success':
                         days_entered += 1
                         logger.info(f"  Entered unit for day {day}")
+                    elif result == 'already_entered':
+                        already_entered_days.append(day)
+                        logger.info(f"  Day {day} already has a value (skipped)")
+                    elif result == 'disabled':
+                        unavailable_days.append(day)
+                        logger.warning(f"  Day {day} is greyed out/disabled")
                     else:
+                        unavailable_days.append(day)
                         logger.warning(f"  Could not find input for day {day}")
 
                 except Exception as e:
+                    unavailable_days.append(day)
                     logger.warning(f"  Error entering day {day}: {e}")
 
             time.sleep(1)
-            return days_entered
+            return days_entered, unavailable_days, already_entered_days
 
         except Exception as e:
             logger.error(f"Calendar entry failed: {e}")
-            return 0
+            return 0, list(service_days), []
 
     def click_update(self) -> bool:
         """Click Update button to save calendar entries, then Close to exit"""
@@ -1106,13 +1461,21 @@ class DDSeBillingBot:
                     success=False,
                     consumer_name=consumer_name,
                     uci=uci,
+                    days_expected=len(service_days),
                     error_message="Could not open calendar",
                     invoice_units=invoice_units,
                     invoice_amount=invoice_amount
                 )
 
             # Enter service days
-            days_entered = self.enter_calendar_units(service_days)
+            days_entered, unavailable_days, already_entered_days = self.enter_calendar_units(service_days)
+
+            # Determine success level
+            # effective_days = newly entered + already had values
+            days_expected = len(service_days)
+            effective_days = days_entered + len(already_entered_days)
+            is_partial = effective_days > 0 and effective_days < days_expected
+            is_success = effective_days == days_expected and days_expected > 0
 
             # Capture billing data from calendar's Invoice Line Summary (before Update)
             portal_data = self.capture_portal_billing_data(uci)
@@ -1121,20 +1484,42 @@ class DDSeBillingBot:
             if not self.click_update():
                 return SubmissionResult(
                     success=False,
+                    partial=is_partial,
                     consumer_name=consumer_name,
                     uci=uci,
                     days_entered=days_entered,
+                    days_expected=days_expected,
+                    unavailable_days=unavailable_days,
+                    already_entered_days=already_entered_days,
                     error_message="Could not click Update",
                     invoice_units=invoice_units,
                     invoice_amount=invoice_amount
                 )
 
-            logger.info(f"✓ Submitted: {consumer_name} ({days_entered} days)")
+            # Determine error message based on outcome
+            if is_partial:
+                error_msg = f"PARTIAL: Only {effective_days}/{days_expected} days covered. Unavailable: {unavailable_days}"
+                logger.warning(f"⚠ Partial: {consumer_name} ({effective_days}/{days_expected} days)")
+            elif effective_days == 0:
+                error_msg = f"FAILED: No days could be entered - all {days_expected} days unavailable"
+                logger.error(f"✗ Failed: {consumer_name} - all days unavailable")
+            else:
+                if already_entered_days:
+                    logger.info(f"✓ Submitted: {consumer_name} ({days_entered} new, {len(already_entered_days)} already entered)")
+                else:
+                    logger.info(f"✓ Submitted: {consumer_name} ({days_entered} days)")
+                error_msg = None
+
             return SubmissionResult(
-                success=True,
+                success=is_success,
+                partial=is_partial,
                 consumer_name=consumer_name,
                 uci=uci,
                 days_entered=days_entered,
+                days_expected=days_expected,
+                unavailable_days=unavailable_days,
+                already_entered_days=already_entered_days,
+                error_message=error_msg,
                 rc_units_billed=portal_data.get('units_billed', 0),
                 rc_gross_amount=portal_data.get('gross_amount', 0),
                 rc_net_amount=portal_data.get('net_amount', 0),
@@ -1149,6 +1534,7 @@ class DDSeBillingBot:
                 success=False,
                 consumer_name=record.get('consumer_name', ''),
                 uci=record.get('uci', ''),
+                days_expected=len(record.get('service_days', [])),
                 error_message=str(e),
                 invoice_units=float(record.get('entered_units', 0) or 0),
                 invoice_amount=float(record.get('entered_amount', 0) or 0)
@@ -1181,13 +1567,21 @@ class DDSeBillingBot:
                     success=False,
                     consumer_name=consumer_name,
                     uci=uci,
+                    days_expected=len(service_days),
                     error_message="Could not open calendar (invoice already open)",
                     invoice_units=invoice_units,
                     invoice_amount=invoice_amount
                 )
 
             # Enter service days
-            days_entered = self.enter_calendar_units(service_days)
+            days_entered, unavailable_days, already_entered_days = self.enter_calendar_units(service_days)
+
+            # Determine success level
+            # effective_days = newly entered + already had values
+            days_expected = len(service_days)
+            effective_days = days_entered + len(already_entered_days)
+            is_partial = effective_days > 0 and effective_days < days_expected
+            is_success = effective_days == days_expected and days_expected > 0
 
             # Capture billing data
             portal_data = self.capture_portal_billing_data(uci)
@@ -1196,20 +1590,42 @@ class DDSeBillingBot:
             if not self.click_update():
                 return SubmissionResult(
                     success=False,
+                    partial=is_partial,
                     consumer_name=consumer_name,
                     uci=uci,
                     days_entered=days_entered,
+                    days_expected=days_expected,
+                    unavailable_days=unavailable_days,
+                    already_entered_days=already_entered_days,
                     error_message="Could not click Update",
                     invoice_units=invoice_units,
                     invoice_amount=invoice_amount
                 )
 
-            logger.info(f"Submitted (in-invoice): {consumer_name} ({days_entered} days)")
+            # Determine error message based on outcome
+            if is_partial:
+                error_msg = f"PARTIAL: Only {effective_days}/{days_expected} days covered. Unavailable: {unavailable_days}"
+                logger.warning(f"⚠ Partial (in-invoice): {consumer_name} ({effective_days}/{days_expected} days)")
+            elif effective_days == 0:
+                error_msg = f"FAILED: No days could be entered - all {days_expected} days unavailable"
+                logger.error(f"✗ Failed (in-invoice): {consumer_name} - all days unavailable")
+            else:
+                if already_entered_days:
+                    logger.info(f"✓ Submitted (in-invoice): {consumer_name} ({days_entered} new, {len(already_entered_days)} already entered)")
+                else:
+                    logger.info(f"✓ Submitted (in-invoice): {consumer_name} ({days_entered} days)")
+                error_msg = None
+
             return SubmissionResult(
-                success=True,
+                success=is_success,
+                partial=is_partial,
                 consumer_name=consumer_name,
                 uci=uci,
                 days_entered=days_entered,
+                days_expected=days_expected,
+                unavailable_days=unavailable_days,
+                already_entered_days=already_entered_days,
+                error_message=error_msg,
                 rc_units_billed=portal_data.get('units_billed', 0),
                 rc_gross_amount=portal_data.get('gross_amount', 0),
                 rc_net_amount=portal_data.get('net_amount', 0),
@@ -1224,6 +1640,7 @@ class DDSeBillingBot:
                 success=False,
                 consumer_name=record.get('consumer_name', ''),
                 uci=record.get('uci', ''),
+                days_expected=len(record.get('service_days', [])),
                 error_message=str(e),
                 invoice_units=float(record.get('entered_units', 0) or 0),
                 invoice_amount=float(record.get('entered_amount', 0) or 0)
@@ -1236,8 +1653,6 @@ class DDSeBillingBot:
 
         Returns: Dict mapping (svc_code, service_month) -> [list of records]
         """
-        from collections import defaultdict
-
         grouped = defaultdict(list)
         for record in records:
             svc_code = record.get('svc_code', '')
@@ -1253,15 +1668,16 @@ class DDSeBillingBot:
 
     def submit_all_records(self, records: List[Dict], provider_name: str = None) -> List[SubmissionResult]:
         """
-        Submit all billing records with optimized navigation.
-        Groups records by invoice and processes all records in an invoice before moving to the next.
+        Submit all billing records with inventory-first approach.
+        First scrapes all available invoices from portal, matches CSV records against inventory,
+        then only processes records that have matching invoices.
 
         Args:
             records: List of billing record dictionaries
             provider_name: Name of the service provider (if None, uses spn_id from first record)
 
         Returns:
-            List of SubmissionResult objects
+            List of SubmissionResult objects (includes skipped records with SKIPPED: prefix in error_message)
         """
         results = []
 
@@ -1283,20 +1699,45 @@ class DDSeBillingBot:
         if not self.navigate_to_invoices():
             return [SubmissionResult(success=False, error_message="Navigation failed")]
 
-        # Cache search results (Level 1)
-        self._invoice_search_cache = self.cache_invoice_search_results()
+        # === INVENTORY-FIRST PHASE ===
+        logger.info("=" * 60)
+        logger.info("=== PHASE 1: Building Invoice Inventory ===")
+        logger.info("=" * 60)
+        self._invoice_search_cache = self.scrape_all_invoice_pages()
+        logger.info(f"Inventory complete: {len(self._invoice_search_cache)} invoices available on portal")
 
-        # Group records by invoice key for efficient batch processing
-        grouped_records = self._group_records_by_invoice(records)
+        # === MATCHING PHASE ===
+        logger.info("=" * 60)
+        logger.info("=== PHASE 2: Matching Records to Inventory ===")
+        logger.info("=" * 60)
+        matchable_records, unmatched_records = self.match_records_to_inventory(records, self._invoice_search_cache)
+        logger.info(f"Match results: {len(matchable_records)} matchable, {len(unmatched_records)} will be skipped")
 
-        # Helper to normalize month format for comparison
-        def normalize_month(m):
-            if not m:
-                return ''
-            parts = m.split('/')
-            if len(parts) == 2:
-                return parts[0].zfill(2) + '/' + parts[1]
-            return m
+        # Create skip results for unmatched records
+        for record in unmatched_records:
+            results.append(SubmissionResult(
+                success=False,
+                consumer_name=record.get('consumer_name', ''),
+                uci=record.get('uci', ''),
+                error_message=f"SKIPPED: {record.get('skip_reason', 'No matching invoice on portal')}",
+                invoice_units=float(record.get('entered_units', 0) or 0),
+                invoice_amount=float(record.get('entered_amount', 0) or 0)
+            ))
+
+        if not matchable_records:
+            logger.warning("No records matched any invoices in inventory - nothing to process")
+            return results
+
+        # === PROCESSING PHASE ===
+        logger.info("=" * 60)
+        logger.info(f"=== PHASE 3: Processing {len(matchable_records)} Matched Records ===")
+        logger.info("=" * 60)
+
+        # Navigate back to search results (may have changed due to pagination)
+        self.navigate_to_invoices()
+
+        # Group matchable records by invoice key for efficient batch processing
+        grouped_records = self._group_records_by_invoice(matchable_records)
 
         # Process each invoice group
         for invoice_key, invoice_records in grouped_records.items():
@@ -1317,11 +1758,10 @@ class DDSeBillingBot:
                     # After first record, cache multi-consumer contents if applicable
                     if invoice_opened_successfully:
                         # Check if this is a multi-consumer invoice (empty UCI in search results)
-                        # Normalize month format for comparison (8/2025 vs 08/2025)
-                        normalized_month = normalize_month(service_month)
+                        normalized_month = self._normalize_month(service_month)
                         search_match = next(
                             (inv for inv in self._invoice_search_cache
-                             if inv.get('svc_code') == svc_code and normalize_month(inv.get('svc_month', '')) == normalized_month),
+                             if inv.get('svc_code') == svc_code and self._normalize_month(inv.get('svc_month', '')) == normalized_month),
                             None
                         )
                         if search_match and not search_match.get('has_uci', True):
@@ -1419,6 +1859,76 @@ def submit_to_ebilling(records: List[Dict], username: str, password: str,
     Returns:
         List of SubmissionResult objects
     """
-    with DDSeBillingBot(username, password, headless=False,
+    with DDSeBillingBot(username, password, headless=None,
                         regional_center=regional_center, portal_url=portal_url) as bot:
         return bot.submit_all_records(records, provider_name)
+
+
+def scrape_invoice_inventory(username: str, password: str,
+                             regional_center: str = "ELARC",
+                             portal_url: str = None,
+                             provider_id: str = None) -> List[Dict]:
+    """
+    Scrape all available invoices from portal without submitting anything.
+    Returns list of invoice records with consumer details.
+
+    For multi-consumer folders (no UCI in search), clicks into each to get
+    individual consumer invoices.
+
+    Args:
+        username: Portal username
+        password: Portal password
+        regional_center: Regional center code (ELARC, SGPRC, etc.)
+        portal_url: Direct URL to the eBilling portal login page
+        provider_id: Provider ID to select (if None, selects first available)
+
+    Returns:
+        List of dicts with keys: invoice_id, last_name, first_name, uci, service_month, svc_code
+    """
+    with DDSeBillingBot(username, password, headless=None,
+                        regional_center=regional_center, portal_url=portal_url) as bot:
+        if not bot.login():
+            logger.error("Login failed for inventory scrape")
+            return []
+
+        # Select provider (use provided ID or first available)
+        if provider_id:
+            if not bot.select_provider(provider_id):
+                logger.error(f"Could not select provider: {provider_id}")
+                return []
+        else:
+            if not bot.select_first_provider():
+                logger.error("Could not select first provider")
+                return []
+
+        if not bot.navigate_to_invoices():
+            logger.error("Could not navigate to invoices")
+            return []
+
+        # Scrape search results (includes both single-consumer and folder rows)
+        search_results = bot.scrape_all_invoice_pages()
+
+        expanded_invoices = []
+
+        for inv in search_results:
+            if inv.get('has_uci'):
+                # Single consumer invoice - parse name directly
+                name_parts = inv.get('consumer_name', '').split(',')
+                expanded_invoices.append({
+                    'invoice_id': inv.get('invoice_id', ''),
+                    'last_name': name_parts[0].strip() if name_parts else '',
+                    'first_name': name_parts[1].strip() if len(name_parts) > 1 else '',
+                    'uci': inv.get('uci', ''),
+                    'service_month': inv.get('svc_month', ''),
+                    'svc_code': inv.get('svc_code', '')
+                })
+            else:
+                # Multi-consumer FOLDER - click into it to get individual invoices
+                folder_invoices = bot.expand_multi_consumer_folder(inv)
+                expanded_invoices.extend(folder_invoices)
+
+                # Navigate back to search results for next folder
+                bot.navigate_to_invoices()
+
+        logger.info(f"Inventory scrape complete: {len(expanded_invoices)} total invoices")
+        return expanded_invoices
