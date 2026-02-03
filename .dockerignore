@@ -1,0 +1,47 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local database
+*.db
+*.sqlite3
+
+# Screenshots (debug output)
+screenshots/
+
+# Environment files (don't include secrets)
+.env
+.env.local
+
+# Uploads (user data)
+uploads/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose*.yml
+Dockerfile.dev
+
+# Documentation
+*.md
+docs/

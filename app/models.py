@@ -79,6 +79,7 @@ class Provider(db.Model):
 
     # Provider info
     name = db.Column(db.String(200), nullable=False)
+    spn_id = db.Column(db.String(20), nullable=True)  # Service Provider Number (e.g., PP0212)
     regional_center = db.Column(db.String(20), nullable=False)
 
     # eBilling credentials

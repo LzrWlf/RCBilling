@@ -27,17 +27,18 @@ def create_app(config_class=Config):
     with app.app_context():
         db.create_all()
 
-        # Create default admin
+        # Create default admin only if ADMIN_PASSWORD is set
         from app.models import User
+        admin_password = os.environ.get('ADMIN_PASSWORD')
         admin = User.query.filter_by(email='admin').first()
-        if not admin:
+        if not admin and admin_password:
             admin = User(
                 email='admin',
                 name='Administrator',
                 role='admin',
                 is_active=True
             )
-            admin.set_password('admin')
+            admin.set_password(admin_password)
             db.session.add(admin)
             db.session.commit()
 

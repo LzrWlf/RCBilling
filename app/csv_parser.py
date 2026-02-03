@@ -22,7 +22,6 @@ class BillingRecord:
 
     # Provider info
     spn_id: str                 # Service Provider Number ID
-    rc_id: str                  # Regional Center ID
 
     # Service days (1-31) - which days had service
     service_days: List[int] = field(default_factory=list)
@@ -119,7 +118,6 @@ def parse_rc_billing_csv(filepath: str) -> List[BillingRecord]:
             svc_subcode=clean(row.get('SVCSCode', '')),
             svc_month_year=clean(row.get('SVCMnYr', '')),
             spn_id=clean(row.get('SPNID', '')),
-            rc_id=clean(row.get('RCID', '')),
             service_days=service_days,
             entered_units=entered_units,
             entered_amount=entered_amount
@@ -145,7 +143,6 @@ def records_to_dict(records: List[BillingRecord]) -> List[dict]:
             'svc_month_year': rec.svc_month_year,
             'service_month': rec.service_month,
             'spn_id': rec.spn_id,
-            'rc_id': rec.rc_id,
             'service_days': rec.service_days,
             'days_count': rec.days_count,
             'entered_units': rec.entered_units,

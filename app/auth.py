@@ -59,6 +59,7 @@ def settings():
 def add_provider():
     """Add a new provider"""
     name = request.form.get('name', '').strip()
+    spn_id = request.form.get('spn_id', '').strip().upper()  # SPN IDs are uppercase
     regional_center = request.form.get('regional_center', '').strip()
     username = request.form.get('username', '').strip()
     password = request.form.get('password', '').strip()
@@ -74,6 +75,7 @@ def add_provider():
     provider = Provider(
         user_id=current_user.id,
         name=name,
+        spn_id=spn_id or None,
         regional_center=regional_center
     )
 
@@ -97,12 +99,15 @@ def update_provider(provider_id):
         return redirect(url_for('auth.settings'))
 
     name = request.form.get('name', '').strip()
+    spn_id = request.form.get('spn_id', '').strip().upper()  # SPN IDs are uppercase
     regional_center = request.form.get('regional_center', '').strip()
     username = request.form.get('username', '').strip()
     password = request.form.get('password', '').strip()
 
     if name:
         provider.name = name
+    # Always update spn_id (can be cleared by setting to empty)
+    provider.spn_id = spn_id or None
     if regional_center and regional_center in REGIONAL_CENTERS:
         provider.regional_center = regional_center
 

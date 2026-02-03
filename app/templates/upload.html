@@ -4,18 +4,21 @@
 
 {% block content %}
 <div class="row justify-content-center">
+    {% if not providers %}
     <div class="col-md-8">
+        <div class="alert alert-warning">
+            <strong>No Regional Centers configured.</strong>
+            <a href="{{ url_for('auth.settings') }}">Go to Settings</a> to add your eBilling credentials.
+        </div>
+    </div>
+    {% else %}
+    <!-- Upload CSV Card -->
+    <div class="col-md-6">
         <div class="card">
             <div class="card-header bg-primary text-white">
                 <h4 class="mb-0">Upload Billing Data</h4>
             </div>
             <div class="card-body">
-                {% if not providers %}
-                <div class="alert alert-warning">
-                    <strong>No Regional Centers configured.</strong>
-                    <a href="{{ url_for('auth.settings') }}">Go to Settings</a> to add your eBilling credentials.
-                </div>
-                {% else %}
                 <form action="{{ url_for('main.upload_file') }}" method="post" enctype="multipart/form-data">
                     <div class="mb-3">
                         <label for="provider_id" class="form-label">Select Provider / Regional Center</label>
@@ -38,22 +41,72 @@
                         <button type="submit" class="btn btn-primary btn-lg">Upload & Preview</button>
                     </div>
                 </form>
-                {% endif %}
             </div>
         </div>
+    </div>
 
-        <div class="card mt-4">
+    <!-- Get Available Invoices Card -->
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header bg-secondary text-white">
+                <h4 class="mb-0">Get Available Invoices</h4>
+            </div>
+            <div class="card-body">
+                <p class="text-muted mb-3">
+                    Generate a report of all invoices currently available on the RC portal.
+                    This shows what can be billed without uploading a CSV.
+                </p>
+                <form action="{{ url_for('main.get_available_invoices') }}" method="post">
+                    <div class="mb-3">
+                        <label for="inventory_provider_id" class="form-label">Select Provider / Regional Center</label>
+                        <select class="form-select form-select-lg" id="inventory_provider_id" name="provider_id" required>
+                            <option value="">-- Select --</option>
+                            {% for p in providers %}
+                            <option value="{{ p.id }}">
+                                {{ p.name }} — {{ p.regional_center }}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <div class="d-grid">
+                        <button type="submit" class="btn btn-secondary btn-lg">Get Available Invoices</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+<div class="row justify-content-center mt-4">
+    <div class="col-md-12">
+        <div class="card">
             <div class="card-header">
                 <h5 class="mb-0">How It Works</h5>
             </div>
             <div class="card-body">
-                <ol class="mb-0">
-                    <li class="mb-2"><strong>Select</strong> - Choose your provider</li>
-                    <li class="mb-2"><strong>Upload</strong> - Select your billing CSV</li>
-                    <li class="mb-2"><strong>Preview</strong> - Review records before submission</li>
-                    <li class="mb-2"><strong>Submit</strong> - Automation enters data into eBilling</li>
-                    <li><strong>Download</strong> - Get a report of results</li>
-                </ol>
+                <div class="row">
+                    <div class="col-md-6">
+                        <h6 class="text-primary">Upload & Submit Flow</h6>
+                        <ol class="mb-0">
+                            <li class="mb-2"><strong>Select</strong> - Choose your provider</li>
+                            <li class="mb-2"><strong>Upload</strong> - Select your billing CSV</li>
+                            <li class="mb-2"><strong>Preview</strong> - Review records before submission</li>
+                            <li class="mb-2"><strong>Submit</strong> - Automation enters data into eBilling</li>
+                            <li><strong>Download</strong> - Get a report of results</li>
+                        </ol>
+                    </div>
+                    <div class="col-md-6">
+                        <h6 class="text-secondary">Available Invoices Flow</h6>
+                        <ol class="mb-0">
+                            <li class="mb-2"><strong>Select</strong> - Choose your provider</li>
+                            <li class="mb-2"><strong>Scan</strong> - Portal is scanned for available invoices</li>
+                            <li class="mb-2"><strong>View</strong> - See all consumers ready for billing</li>
+                            <li><strong>Download</strong> - Export the inventory as CSV</li>
+                        </ol>
+                    </div>
+                </div>
             </div>
         </div>
     </div>

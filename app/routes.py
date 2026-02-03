@@ -6,10 +6,11 @@ import csv
 import io
 from datetime import datetime
 from app.csv_parser import parse_rc_billing_csv, records_to_dict
-from app.automation.dds_ebilling import submit_to_ebilling
+from app.automation.dds_ebilling import submit_to_ebilling, scrape_invoice_inventory
 from app.models import db, Provider, SubmissionLog
 
 _last_submission_results = {}
+_last_available_invoices = {}
 
 main_bp = Blueprint('main', __name__)
 
@@ -103,12 +104,20 @@ def submit_claims():
             portal_url=provider.rc_portal_url
         )
 
-        success_count = sum(1 for r in results if r.success)
-        failed_count = len(results) - success_count
+        # Count by status category
+        success_count = sum(1 for r in results if r.success and not r.partial)
+        partial_count = sum(1 for r in results if r.partial)
+        skipped_count = sum(1 for r in results if not r.success and not r.partial and r.error_message and r.error_message.startswith('SKIPPED:'))
+        failed_count = len(results) - success_count - partial_count - skipped_count
+
+        # Build lookup for original records by UCI
+        orig_by_uci = {rec.get('uci', ''): rec for rec in records}
 
         result_details = []
-        for i, r in enumerate(results):
-            orig = records[i] if i < len(records) else {}
+        for r in results:
+            # Find matching original record by UCI
+            orig = orig_by_uci.get(r.uci, {})
+            is_skipped = r.error_message and r.error_message.startswith('SKIPPED:')
             result_details.append({
                 'consumer_name': r.consumer_name or orig.get('consumer_name', ''),
                 'uci': r.uci or orig.get('uci', ''),
@@ -117,9 +126,13 @@ def submit_claims():
                 'svc_subcode': orig.get('svc_subcode', ''),
                 'service_month': orig.get('service_month', ''),
                 'service_days': orig.get('service_days', []),
-                'expected_days': len(orig.get('service_days', [])),
+                'expected_days': r.days_expected or len(orig.get('service_days', [])),
                 'success': r.success,
+                'partial': r.partial,
+                'skipped': is_skipped,
                 'days_entered': r.days_entered,
+                'unavailable_days': r.unavailable_days or [],
+                'already_entered_days': r.already_entered_days or [],
                 'error': r.error_message or '',
                 # Invoice data from CSV (may be empty)
                 'invoice_units': r.invoice_units,
@@ -136,17 +149,19 @@ def submit_claims():
             'provider_name': provider.name,
             'total_records': len(results),
             'success_count': success_count,
+            'partial_count': partial_count,
+            'skipped_count': skipped_count,
             'failed_count': failed_count,
             'results': result_details
         }
 
-        # Log submission
-        total_services = sum(r.get('expected_days', 0) for r in result_details)
+        # Log submission (only count actual attempts, not skipped)
+        total_services = sum(r.get('expected_days', 0) for r in result_details if not r.get('skipped'))
         log = SubmissionLog(
             user_id=current_user.id,
             provider_id=provider.id,
             filename=claims_data.get('filename', ''),
-            total_records=len(results),
+            total_records=len(results) - skipped_count,  # Actual attempts
             successful=success_count,
             failed=failed_count,
             total_services=total_services
@@ -157,13 +172,26 @@ def submit_claims():
         provider.total_services += total_services
         db.session.commit()
 
+        # Build message with status breakdown
+        processed = len(results) - skipped_count
+        parts = [f'{success_count} success']
+        if partial_count > 0:
+            parts.append(f'{partial_count} partial')
+        if failed_count > 0:
+            parts.append(f'{failed_count} failed')
+        if skipped_count > 0:
+            parts.append(f'{skipped_count} skipped')
+        message = f'Processed {processed} records: ' + ', '.join(parts)
+
         return jsonify({
             'status': 'complete',
-            'message': f'Submitted {success_count} of {len(results)} records',
+            'message': message,
             'success_count': success_count,
+            'partial_count': partial_count,
+            'skipped_count': skipped_count,
             'failed_count': failed_count,
             'results': result_details,
-            'has_errors': failed_count > 0
+            'has_errors': failed_count > 0 or partial_count > 0
         })
 
     except Exception as e:
@@ -185,13 +213,24 @@ def download_report():
     # Header row with invoice vs RC portal comparison columns
     writer.writerow([
         'Status', 'Consumer Name', 'UCI', 'Auth Number', 'SVC Code', 'SVC Subcode',
-        'Service Month', 'Service Days', 'Days Entered',
+        'Service Month', 'Service Days', 'Days Entered', 'Days Expected', 'Unavailable Days', 'Already Entered',
         'Invoice Units', 'Invoice Amount',  # From CSV (may be empty)
         'RC Units', 'RC Gross', 'RC Net', 'RC Unit Rate',  # From RC Portal
         'Error'
     ])
 
-    for r in sorted(user_results['results'], key=lambda x: (x['success'], x['consumer_name'])):
+    # Sort: success first, then partial, then skipped, then failed
+    def sort_key(x):
+        if x['success'] and not x.get('partial'):
+            return (0, x['consumer_name'])
+        elif x.get('partial'):
+            return (1, x['consumer_name'])
+        elif x.get('skipped'):
+            return (2, x['consumer_name'])
+        else:
+            return (3, x['consumer_name'])
+
+    for r in sorted(user_results['results'], key=sort_key):
         # Format billing values - show empty string if zero/not available
         inv_units = r.get('invoice_units', 0)
         inv_amount = r.get('invoice_amount', 0)
@@ -200,11 +239,27 @@ def download_report():
         rc_net = r.get('rc_net', 0)
         rc_rate = r.get('rc_unit_rate', 0)
 
+        # Determine status
+        if r['success'] and not r.get('partial'):
+            status = 'SUCCESS'
+        elif r.get('partial'):
+            status = 'PARTIAL'
+        elif r.get('skipped'):
+            status = 'SKIPPED'
+        else:
+            status = 'FAILED'
+
+        # Format unavailable days and already entered days
+        unavailable = r.get('unavailable_days', [])
+        unavailable_str = ', '.join(str(d) for d in unavailable) if unavailable else ''
+        already_entered = r.get('already_entered_days', [])
+        already_entered_str = ', '.join(str(d) for d in already_entered) if already_entered else ''
+
         writer.writerow([
-            'SUCCESS' if r['success'] else 'FAILED',
+            status,
             r['consumer_name'], r['uci'], r['auth_number'], r['svc_code'], r['svc_subcode'],
             r['service_month'], ', '.join(str(d) for d in r.get('service_days', [])),
-            r['days_entered'],
+            r['days_entered'], r.get('expected_days', ''), unavailable_str, already_entered_str,
             f'{inv_units:.2f}' if inv_units else '',
             f'${inv_amount:.2f}' if inv_amount else '',
             f'{rc_units:.2f}' if rc_units else '',
@@ -218,8 +273,10 @@ def download_report():
     writer.writerow(['SUMMARY'])
     writer.writerow(['Time', user_results['timestamp']])
     writer.writerow(['Provider', user_results.get('provider_name', '')])
-    writer.writerow(['Total', user_results['total_records']])
+    writer.writerow(['Total Records', user_results['total_records']])
     writer.writerow(['Success', user_results['success_count']])
+    writer.writerow(['Partial (some days unavailable)', user_results.get('partial_count', 0)])
+    writer.writerow(['Skipped (no matching invoice)', user_results.get('skipped_count', 0)])
     writer.writerow(['Failed', user_results['failed_count']])
 
     output.seek(0)
@@ -227,4 +284,136 @@ def download_report():
         output.getvalue(),
         mimetype='text/csv',
         headers={'Content-Disposition': f'attachment; filename=submission_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'}
+    )
+
+
+@main_bp.route('/available-invoices', methods=['POST'])
+@login_required
+def get_available_invoices():
+    """Generate a report of all available invoices on the RC portal"""
+    global _last_available_invoices
+
+    provider_id = request.form.get('provider_id')
+    if not provider_id:
+        flash('Please select a provider', 'error')
+        return redirect(url_for('main.index'))
+
+    provider = Provider.query.get(provider_id)
+    if not provider or provider.user_id != current_user.id:
+        flash('Invalid provider selection', 'error')
+        return redirect(url_for('main.index'))
+
+    username, password = provider.get_credentials()
+    if not username or not password:
+        flash(f'No credentials for {provider.regional_center}. Go to Settings.', 'error')
+        return redirect(url_for('main.index'))
+
+    try:
+        # Call inventory-only function with SPN ID for provider selection
+        # SPN ID (e.g., PP0212) is more reliable than name for selection
+        inventory = scrape_invoice_inventory(
+            username=username,
+            password=password,
+            regional_center=provider.regional_center,
+            portal_url=provider.rc_portal_url,
+            provider_id=provider.spn_id or provider.name  # Prefer SPN ID, fall back to name
+        )
+
+        # Store for download
+        _last_available_invoices[current_user.id] = {
+            'timestamp': datetime.now(),
+            'provider_name': provider.name,
+            'invoices': inventory
+        }
+
+        return render_template('available_invoices.html',
+                               invoices=inventory,
+                               provider=provider)
+
+    except Exception as e:
+        flash(f'Error scraping invoices: {str(e)}', 'error')
+        return redirect(url_for('main.index'))
+
+
+@main_bp.route('/available-invoices-ajax', methods=['POST'])
+@login_required
+def get_available_invoices_ajax():
+    """AJAX endpoint to get available invoices using SPN ID from uploaded CSV"""
+    global _last_available_invoices
+
+    data = request.json
+    provider_id = data.get('provider_id')
+    spn_id = data.get('spn_id')  # SPN ID from the uploaded CSV
+
+    if not provider_id:
+        return jsonify({'status': 'error', 'message': 'Provider not specified'})
+
+    provider = Provider.query.get(provider_id)
+    if not provider or provider.user_id != current_user.id:
+        return jsonify({'status': 'error', 'message': 'Invalid provider'})
+
+    username, password = provider.get_credentials()
+    if not username or not password:
+        return jsonify({'status': 'error', 'message': f'No credentials for {provider.regional_center}. Go to Settings.'})
+
+    if not spn_id:
+        return jsonify({'status': 'error', 'message': 'No SPN ID found in uploaded CSV'})
+
+    try:
+        # Use SPN ID from the CSV for provider selection
+        inventory = scrape_invoice_inventory(
+            username=username,
+            password=password,
+            regional_center=provider.regional_center,
+            portal_url=provider.rc_portal_url,
+            provider_id=spn_id  # Use SPN ID from CSV
+        )
+
+        # Store for download
+        _last_available_invoices[current_user.id] = {
+            'timestamp': datetime.now(),
+            'provider_name': provider.name,
+            'invoices': inventory
+        }
+
+        return jsonify({
+            'status': 'success',
+            'invoices': inventory,
+            'count': len(inventory)
+        })
+
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': f'Error scraping invoices: {str(e)}'})
+
+
+@main_bp.route('/download-available-invoices')
+@login_required
+def download_available_invoices():
+    """Download the available invoices as a CSV file"""
+    global _last_available_invoices
+
+    user_results = _last_available_invoices.get(current_user.id)
+    if not user_results:
+        return "No inventory results available", 404
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow(['Last Name', 'First Name', 'UCI', 'Service Month', 'Service Code', 'Invoice ID'])
+
+    for inv in user_results['invoices']:
+        writer.writerow([
+            inv.get('last_name', ''),
+            inv.get('first_name', ''),
+            inv.get('uci', ''),
+            inv.get('service_month', ''),
+            inv.get('svc_code', ''),
+            inv.get('invoice_id', '')
+        ])
+
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename=available_invoices_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'}
     )

@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}Available Invoices - {{ provider.name }}{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-12">
+        <div class="card">
+            <div class="card-header bg-secondary text-white d-flex justify-content-between align-items-center">
+                <h4 class="mb-0">Available Invoices - {{ provider.name }}</h4>
+                <span class="badge bg-light text-dark">{{ invoices|length }} invoices found</span>
+            </div>
+            <div class="card-body">
+                <div class="mb-3 d-flex justify-content-between align-items-center">
+                    <div>
+                        <span class="text-muted">Provider: {{ provider.name }} ({{ provider.regional_center }})</span>
+                    </div>
+                    <div>
+                        <a href="{{ url_for('main.download_available_invoices') }}" class="btn btn-success">
+                            Download CSV
+                        </a>
+                        <a href="{{ url_for('main.index') }}" class="btn btn-outline-secondary ms-2">
+                            Back to Home
+                        </a>
+                    </div>
+                </div>
+
+                {% if invoices %}
+                <div class="table-responsive">
+                    <table class="table table-striped table-hover">
+                        <thead class="table-dark">
+                            <tr>
+                                <th>Last Name</th>
+                                <th>First Name</th>
+                                <th>UCI</th>
+                                <th>Service Month</th>
+                                <th>Service Code</th>
+                                <th>Invoice ID</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for inv in invoices %}
+                            <tr>
+                                <td>{{ inv.last_name }}</td>
+                                <td>{{ inv.first_name }}</td>
+                                <td><code>{{ inv.uci }}</code></td>
+                                <td>{{ inv.service_month }}</td>
+                                <td>{{ inv.svc_code }}</td>
+                                <td><small class="text-muted">{{ inv.invoice_id }}</small></td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+                {% else %}
+                <div class="alert alert-info">
+                    No invoices found on the portal for this provider.
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
