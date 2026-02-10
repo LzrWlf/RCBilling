@@ -56,23 +56,44 @@
                     Generate a report of all invoices currently available on the RC portal.
                     This shows what can be billed without uploading a CSV.
                 </p>
-                <form action="{{ url_for('main.get_available_invoices') }}" method="post">
-                    <div class="mb-3">
-                        <label for="inventory_provider_id" class="form-label">Select Provider / Regional Center</label>
-                        <select class="form-select form-select-lg" id="inventory_provider_id" name="provider_id" required>
-                            <option value="">-- Select --</option>
-                            {% for p in providers %}
-                            <option value="{{ p.id }}">
-                                {{ p.name }} — {{ p.regional_center }}
-                            </option>
-                            {% endfor %}
-                        </select>
-                    </div>
+                <div class="mb-3">
+                    <label for="inventory_provider_id" class="form-label">Select Provider / Regional Center</label>
+                    <select class="form-select form-select-lg" id="inventory_provider_id" name="provider_id" form="form-invoices-selected" required>
+                        <option value="">-- Select --</option>
+                        {% for p in providers %}
+                        <option value="{{ p.id }}">
+                            {{ p.name }} — {{ p.regional_center }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                </div>
 
-                    <div class="d-grid">
-                        <button type="submit" class="btn btn-secondary btn-lg">Get Available Invoices</button>
-                    </div>
-                </form>
+                <div class="d-grid gap-2">
+                    <form id="form-invoices-selected" action="{{ url_for('main.get_available_invoices') }}" method="post">
+                        <input type="hidden" name="provider_id" id="hidden_provider_selected">
+                        <button type="submit" class="btn btn-secondary btn-lg w-100">Get Invoices for Selected Provider</button>
+                    </form>
+                    <form id="form-invoices-all" action="{{ url_for('main.get_available_invoices_all') }}" method="post">
+                        <input type="hidden" name="provider_id" id="hidden_provider_all">
+                        <button type="submit" class="btn btn-outline-secondary btn-lg w-100">Get Invoices for All Providers</button>
+                    </form>
+                </div>
+
+                <script>
+                    document.getElementById('inventory_provider_id').addEventListener('change', function() {
+                        document.getElementById('hidden_provider_selected').value = this.value;
+                        document.getElementById('hidden_provider_all').value = this.value;
+                    });
+                    // Prevent submit if no provider selected
+                    ['form-invoices-selected', 'form-invoices-all'].forEach(function(formId) {
+                        document.getElementById(formId).addEventListener('submit', function(e) {
+                            if (!document.getElementById('inventory_provider_id').value) {
+                                e.preventDefault();
+                                alert('Please select a provider first.');
+                            }
+                        });
+                    });
+                </script>
             </div>
         </div>
     </div>

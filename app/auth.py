@@ -68,6 +68,10 @@ def add_provider():
         flash('Provider name is required', 'error')
         return redirect(url_for('auth.settings'))
 
+    if not spn_id:
+        flash('SPN ID (Service Provider Number) is required', 'error')
+        return redirect(url_for('auth.settings'))
+
     if not regional_center or regional_center not in REGIONAL_CENTERS:
         flash('Please select a Regional Center', 'error')
         return redirect(url_for('auth.settings'))
@@ -75,7 +79,7 @@ def add_provider():
     provider = Provider(
         user_id=current_user.id,
         name=name,
-        spn_id=spn_id or None,
+        spn_id=spn_id,
         regional_center=regional_center
     )
 
@@ -106,8 +110,10 @@ def update_provider(provider_id):
 
     if name:
         provider.name = name
-    # Always update spn_id (can be cleared by setting to empty)
-    provider.spn_id = spn_id or None
+    if not spn_id:
+        flash('SPN ID (Service Provider Number) is required', 'error')
+        return redirect(url_for('auth.settings'))
+    provider.spn_id = spn_id
     if regional_center and regional_center in REGIONAL_CENTERS:
         provider.regional_center = regional_center
 

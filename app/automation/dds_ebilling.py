@@ -86,9 +86,11 @@ class DDSeBillingBot:
             self.portal_url = RC_PORTAL_URLS.get(regional_center, RC_PORTAL_URLS['ELARC'])
         logger.info(f"Using portal URL: {self.portal_url} for {regional_center}")
 
+        self.password_expiry_days = None  # Populated if portal shows expiry warning
+
         # Invoice caching for efficient multi-record processing
         self._invoice_search_cache: List[Dict] = []  # Level 1: Search results
-        self._multi_consumer_cache: Dict[tuple, List[Dict]] = {}  # Level 2: Contents inside multi-consumer invoices
+        self._multi_consumer_cache: Dict = {}  # Level 2: Contents inside multi-consumer invoices (keyed by invoice_id or (svc_code, month) tuple)
         self._current_invoice_key: Optional[tuple] = None  # Track currently open invoice (svc_code, svc_month_year)
 
     def __enter__(self):
@@ -114,11 +116,23 @@ class DDSeBillingBot:
 
     def stop(self):
         """Close browser session"""
+        self.logout()  # End server-side session before closing browser
         if self.browser:
             self.browser.close()
         if self.playwright:
             self.playwright.stop()
         logger.info("Browser closed")
+
+    def logout(self):
+        """Log out of the portal to cleanly end the server-side session"""
+        try:
+            page_text = self.page.evaluate('() => document.body.innerText || ""')
+            if 'Logout' in page_text:
+                self._js_click("Logout")
+                time.sleep(2)
+                logger.info("Logged out of portal")
+        except Exception as e:
+            logger.warning(f"Logout failed: {e}")
 
     def _js_click(self, text: str) -> bool:
         """Click element containing text using JavaScript - most reliable method"""
@@ -352,24 +366,68 @@ class DDSeBillingBot:
                     self._screenshot("error_still_on_login")
                     return False
 
-            # Accept agreement using JavaScript
-            logger.info("Checking for user agreement...")
-            time.sleep(2)
-            self.page.evaluate('''() => {
-                const elements = document.querySelectorAll('input, button, a');
-                for (const el of elements) {
-                    const text = (el.value || el.innerText || '').trim();
-                    if (text === 'Accept' || text === 'I Agree' || text === 'ACCEPT') {
-                        el.click();
-                        return true;
-                    }
-                }
-                return false;
-            }''')
-            self.page.wait_for_load_state("networkidle")
-            time.sleep(2)
-            self._screenshot("05_after_agreement")
+            # Post-login: handle dialogs in whatever order the portal presents them
+            import re
+            for attempt in range(5):  # Max 5 rounds of dialog handling
+                time.sleep(2)
+                try:
+                    page_text = self.page.evaluate('() => document.body.innerText || ""')
+                except:
+                    break
 
+                self._screenshot(f"05_post_login_round_{attempt}")
+                logger.info(f"Post-login round {attempt}: checking page state...")
+
+                # 1. Check for password expiry overlay
+                expiry_match = re.search(r'password will expire in (\d+) day', page_text)
+                if expiry_match:
+                    self.password_expiry_days = int(expiry_match.group(1))
+                    logger.warning(f"Password expires in {self.password_expiry_days} days")
+                    self._js_click("OK")
+                    time.sleep(1)
+                    continue  # Re-check page after dismissing
+
+                # 2. Check for agreement dialog (must come before User Profile check
+                #    because "My Profile" nav link appears on every page including Dashboard)
+                if 'I do not agree' in page_text:
+                    logger.info("Accepting user agreement...")
+                    self.page.evaluate('''() => {
+                        const elements = document.querySelectorAll('input, button, a');
+                        for (const el of elements) {
+                            const text = (el.value || el.innerText || '').trim();
+                            if (text === 'Accept' || text === 'I Agree' || text === 'ACCEPT') {
+                                el.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }''')
+                    try:
+                        self.page.wait_for_load_state("networkidle")
+                    except:
+                        pass
+                    time.sleep(1)
+                    continue  # Re-check page after accepting
+
+                # 3. Check for User Profile / change password form
+                #    Use "User Profile of" to match the page heading, not the "My Profile" nav link
+                if 'User Profile of' in page_text:
+                    logger.info("On User Profile page, clicking Close...")
+                    self._js_click("Close")
+                    time.sleep(1)
+                    try:
+                        self.page.wait_for_load_state("networkidle")
+                    except:
+                        pass
+                    time.sleep(1)
+                    continue  # Re-check page after closing
+
+                # 4. If we see Service Provider Selection, we're done
+                if 'Service Provider Selection' in page_text:
+                    logger.info("Reached Service Provider Selection — login complete")
+                    break
+
+            self._screenshot("05_after_navigation")
             logger.info("Login successful")
             return True
 
@@ -384,27 +442,26 @@ class DDSeBillingBot:
             logger.info("Selecting first available provider...")
             self._screenshot("05_provider_selection")
 
-            # Look for provider table specifically - it has Service Provider # column
+            # Dojo DataGrid multi-view: each column in separate view, so each row has 1 cell.
+            # Search individual cells for SPN pattern.
             result = self.page.evaluate('''() => {
-                // Find table rows that look like provider entries (have SPN ID pattern like HP1234, PP1234)
-                const rows = document.querySelectorAll('tr');
-                for (const row of rows) {
-                    const cells = row.querySelectorAll('td');
-                    if (cells.length >= 2) {
-                        const firstCellText = cells[0]?.innerText?.trim() || '';
-                        // SPN IDs typically start with 2 letters followed by numbers (e.g., HP0197, PP0212)
-                        if (/^[A-Za-z]{2}\d+$/.test(firstCellText)) {
-                            row.click();
-                            return 'clicked provider: ' + firstCellText;
-                        }
+                const allCells = document.querySelectorAll('.dojoxGridCell');
+                for (const cell of allCells) {
+                    const text = (cell.innerText || '').trim();
+                    if (/^[A-Za-z]{2}\\d+$/.test(text)) {
+                        const row = cell.closest('.dojoxGridRow');
+                        if (row) { row.click(); return 'clicked provider: ' + text; }
+                        cell.click();
+                        return 'clicked provider cell: ' + text;
                     }
                 }
-                // Fallback: click first data row with 2+ cells
-                for (const row of rows) {
-                    const cells = row.querySelectorAll('td');
-                    if (cells.length >= 2) {
-                        row.click();
-                        return 'clicked first data row';
+                // Fallback: search plain td elements
+                const tds = document.querySelectorAll('td');
+                for (const td of tds) {
+                    const text = (td.innerText || '').trim();
+                    if (/^[A-Za-z]{2}\\d+$/.test(text)) {
+                        const row = td.closest('tr');
+                        if (row) { row.click(); return 'clicked provider row: ' + text; }
                     }
                 }
                 return false;
@@ -425,6 +482,82 @@ class DDSeBillingBot:
             logger.error(f"Failed to select first provider: {e}")
             return False
 
+    def get_available_providers(self) -> List[Dict]:
+        """Read all providers from the provider selection table without clicking any."""
+        try:
+            logger.info("Reading available providers from table...")
+            time.sleep(1)
+            self._screenshot("provider_table_read")
+
+            # Diagnostic: log grid structure to confirm multi-view layout
+            diag = self.page.evaluate('''() => {
+                return {
+                    dojoxGridRows: document.querySelectorAll('.dojoxGridRow').length,
+                    dojoxGridCells: document.querySelectorAll('.dojoxGridCell').length,
+                    sampleCells: Array.from(document.querySelectorAll('.dojoxGridCell'))
+                        .slice(0, 10).map(c => (c.innerText || '').trim().substring(0, 20))
+                };
+            }''')
+            logger.info(f"Grid diagnostic: {diag}")
+
+            # Dojo DataGrid multi-view layout: each column is in a separate "view",
+            # so each .dojoxGridRow contains only 1 cell. Search ALL cells individually.
+            providers = self.page.evaluate('''() => {
+                const results = [];
+                const seen = new Set();
+                const allCells = document.querySelectorAll('.dojoxGridCell');
+                for (const cell of allCells) {
+                    const text = (cell.innerText || '').trim();
+                    if (/^[A-Za-z]{2}\\d+$/.test(text) && !seen.has(text.toUpperCase())) {
+                        seen.add(text.toUpperCase());
+                        let name = '';
+                        const row = cell.closest('.dojoxGridRow');
+                        const content = row?.closest('.dojoxGridContent, .dojoxGridScrollbox');
+                        if (content) {
+                            const rowIdx = Array.from(
+                                content.querySelectorAll('.dojoxGridRow')
+                            ).indexOf(row);
+                            const view = content.closest('.dojoxGridView');
+                            const allViews = view?.parentElement?.querySelectorAll(':scope > .dojoxGridView') || [];
+                            for (const v of allViews) {
+                                if (v === view) continue;
+                                const otherRows = v.querySelectorAll('.dojoxGridContent .dojoxGridRow, .dojoxGridScrollbox .dojoxGridRow');
+                                if (otherRows[rowIdx]) {
+                                    const otherText = (otherRows[rowIdx].innerText || '').trim();
+                                    if (otherText && !/^[A-Za-z]{2}\\d+$/.test(otherText)) {
+                                        name = otherText;
+                                    }
+                                }
+                            }
+                        }
+                        results.push({ spn_id: text.toUpperCase(), name: name });
+                    }
+                }
+                // Fallback: try plain td cells if dojoxGridCell returned nothing
+                if (results.length === 0) {
+                    const tds = document.querySelectorAll('td');
+                    for (const td of tds) {
+                        const text = (td.innerText || '').trim();
+                        if (/^[A-Za-z]{2}\\d+$/.test(text) && !seen.has(text.toUpperCase())) {
+                            seen.add(text.toUpperCase());
+                            // Get description from next sibling td
+                            const nextTd = td.nextElementSibling;
+                            const name = nextTd ? (nextTd.innerText || '').trim() : '';
+                            results.push({ spn_id: text.toUpperCase(), name: name });
+                        }
+                    }
+                }
+                return results;
+            }''')
+
+            logger.info(f"Found {len(providers)} providers in table")
+            for p in providers:
+                logger.info(f"  Provider: {p['spn_id']} - {p['name']}")
+            return providers
+        except Exception as e:
+            logger.error(f"Failed to read provider table: {e}")
+            return []
+
     def select_provider(self, provider_identifier: str) -> bool:
         """Select the service provider by SPN ID or name"""
         try:
@@ -433,19 +566,16 @@ class DDSeBillingBot:
 
             clicked = False
 
-            # Method 1: Try exact SPN ID match first (e.g., PE1234)
-            # SPN IDs appear in a specific column in the provider table
+            # Method 1: Try exact SPN ID match — search individual cells (multi-view layout)
             clicked = self.page.evaluate(f'''() => {{
-                const rows = document.querySelectorAll('tr');
-                for (const row of rows) {{
-                    const cells = row.querySelectorAll('td');
-                    for (const cell of cells) {{
-                        const text = cell.innerText.trim();
-                        // Match SPN ID exactly (case-insensitive)
-                        if (text.toUpperCase() === '{provider_identifier}'.toUpperCase()) {{
-                            row.click();
-                            return true;
-                        }}
+                const allCells = document.querySelectorAll('.dojoxGridCell');
+                for (const cell of allCells) {{
+                    const text = (cell.innerText || '').trim();
+                    if (text.toUpperCase() === '{provider_identifier}'.toUpperCase()) {{
+                        const row = cell.closest('.dojoxGridRow');
+                        if (row) {{ row.click(); return true; }}
+                        cell.click();
+                        return true;
                     }}
                 }}
                 return false;
@@ -460,16 +590,14 @@ class DDSeBillingBot:
                 numeric_part = ''.join(c for c in provider_identifier if c.isdigit())
                 if numeric_part:
                     clicked = self.page.evaluate(f'''() => {{
-                        const rows = document.querySelectorAll('tr');
-                        for (const row of rows) {{
-                            const cells = row.querySelectorAll('td');
-                            for (const cell of cells) {{
-                                const text = cell.innerText.trim();
-                                // Match if cell ends with the numeric portion
-                                if (text.match(/[A-Za-z]+{numeric_part}$/i)) {{
-                                    row.click();
-                                    return true;
-                                }}
+                        const allCells = document.querySelectorAll('.dojoxGridCell');
+                        for (const cell of allCells) {{
+                            const text = (cell.innerText || '').trim();
+                            if (text.match(/[A-Za-z]+{numeric_part}$/i)) {{
+                                const row = cell.closest('.dojoxGridRow');
+                                if (row) {{ row.click(); return true; }}
+                                cell.click();
+                                return true;
                             }}
                         }}
                         return false;
@@ -483,10 +611,12 @@ class DDSeBillingBot:
                 safe_identifier = provider_identifier.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
                 clicked = self.page.evaluate(f'''() => {{
                     const searchTerm = '{safe_identifier}'.toLowerCase();
-                    const rows = document.querySelectorAll('tr');
-                    for (const row of rows) {{
-                        if (row.innerText.toLowerCase().includes(searchTerm)) {{
-                            row.click();
+                    const allCells = document.querySelectorAll('.dojoxGridCell');
+                    for (const cell of allCells) {{
+                        if ((cell.innerText || '').toLowerCase().includes(searchTerm)) {{
+                            const row = cell.closest('.dojoxGridRow');
+                            if (row) {{ row.click(); return true; }}
+                            cell.click();
                             return true;
                         }}
                     }}
@@ -494,6 +624,36 @@ class DDSeBillingBot:
                 }}''')
                 if clicked:
                     logger.info(f"Selected provider by name match: {provider_identifier}")
+
+            # Method 4: Fallback to plain td elements
+            if not clicked:
+                safe_identifier = provider_identifier.replace("\\", "\\\\").replace("'", "\\'").replace('"', '\\"')
+                clicked = self.page.evaluate(f'''() => {{
+                    const tds = document.querySelectorAll('td');
+                    for (const td of tds) {{
+                        const text = (td.innerText || '').trim();
+                        if (text.toUpperCase() === '{safe_identifier}'.toUpperCase() ||
+                            text.toLowerCase().includes('{safe_identifier}'.toLowerCase())) {{
+                            const row = td.closest('tr');
+                            if (row) {{ row.click(); return true; }}
+                        }}
+                    }}
+                    // Also try SPN pattern match on td elements
+                    for (const td of tds) {{
+                        const text = (td.innerText || '').trim();
+                        if (/^[A-Za-z]{{2}}\\d+$/.test(text)) {{
+                            const numericPart = text.replace(/[A-Za-z]/g, '');
+                            const searchNumeric = '{safe_identifier}'.replace(/[A-Za-z]/g, '');
+                            if (numericPart === searchNumeric) {{
+                                const row = td.closest('tr');
+                                if (row) {{ row.click(); return true; }}
+                            }}
+                        }}
+                    }}
+                    return false;
+                }}''')
+                if clicked:
+                    logger.info(f"Selected provider by td fallback: {provider_identifier}")
 
             if not clicked:
                 logger.error(f"Provider '{provider_identifier}' not found")
@@ -594,13 +754,92 @@ class DDSeBillingBot:
                 logger.warning("Could not click Search button")
 
             self.page.wait_for_load_state("networkidle")
-            time.sleep(3)
+            time.sleep(2)
+
+            # Wait for table content to appear (invoice IDs are 7-digit numbers)
+            logger.info("Waiting for invoice table to load...")
+            try:
+                # Wait up to 10 seconds for invoice data to appear
+                self.page.wait_for_function(
+                    '''() => {
+                        // Check standard td cells
+                        const tds = document.querySelectorAll('td');
+                        for (const td of tds) {
+                            if (/^\\d{7}$/.test((td.innerText || '').trim())) return true;
+                        }
+                        // Check Dojo DataGrid cells
+                        const gridCells = document.querySelectorAll('.dojoxGridCell');
+                        for (const cell of gridCells) {
+                            if (/^\\d{7}$/.test((cell.innerText || '').trim())) return true;
+                        }
+                        return false;
+                    }''',
+                    timeout=10000
+                )
+                logger.info("Invoice table data loaded successfully")
+            except Exception as e:
+                logger.warning(f"Timeout waiting for invoice table data: {e}")
+                # Continue anyway - the table might be empty legitimately
+
+            time.sleep(1)
             self._screenshot("08_after_search")
 
             return True
         except Exception as e:
             logger.error(f"Navigation failed: {e}")
             self._screenshot("error_navigation")
+            return False
+
+    def navigate_to_provider_selection(self) -> bool:
+        """Navigate back to Service Provider Selection (Dashboard)"""
+        try:
+            logger.info("Navigating back to Service Provider Selection...")
+            self._screenshot("nav_back_before")
+
+            # Strategy 1: Click "Home" tab (main nav) — this is the primary nav tab
+            self._js_click("Home")
+            time.sleep(2)
+            self.page.wait_for_load_state("networkidle")
+            time.sleep(1)
+
+            page_text = self.page.evaluate('() => document.body.innerText || ""')
+            if 'Service Provider Selection' in page_text:
+                logger.info("Back at Service Provider Selection via Home tab")
+                self._screenshot("nav_back_success")
+                return True
+
+            # Strategy 2: Click "Dashboard" sub-tab (under Home)
+            self._js_click("Dashboard")
+            time.sleep(2)
+            self.page.wait_for_load_state("networkidle")
+            time.sleep(1)
+
+            page_text = self.page.evaluate('() => document.body.innerText || ""')
+            if 'Service Provider Selection' in page_text:
+                logger.info("Back at Service Provider Selection via Dashboard sub-tab")
+                self._screenshot("nav_back_success")
+                return True
+
+            # Strategy 3: Try Playwright selectors for nav links
+            for link_text in ["Home", "Dashboard", "Service Provider"]:
+                try:
+                    self.page.click(f'a:has-text("{link_text}")', timeout=3000)
+                    time.sleep(2)
+                    self.page.wait_for_load_state("networkidle")
+                    page_text = self.page.evaluate('() => document.body.innerText || ""')
+                    if 'Service Provider Selection' in page_text:
+                        logger.info(f"Back at Service Provider Selection via '{link_text}' link")
+                        self._screenshot("nav_back_success")
+                        return True
+                except:
+                    continue
+
+            logger.warning("Could not navigate back to Service Provider Selection")
+            self._screenshot("nav_back_failed")
+            return False
+        except Exception as e:
+            logger.warning(f"navigate_to_provider_selection failed: {e}")
+            self._screenshot("nav_back_error")
             return False
 
     def _debug_page_structure(self):
@@ -628,73 +867,323 @@ class DDSeBillingBot:
         logger.info(f"Page structure: {info}")
         return info
 
+    def _wait_for_invoice_table(self, timeout: int = 10) -> bool:
+        """
+        Wait for invoice table to have data rows.
+        Detects invoice table by looking for 7-digit invoice IDs in either
+        standard HTML table cells or Dojo DataGrid cells.
+        Returns True if table data found, False if timeout.
+        """
+        import time as time_module
+        start = time_module.time()
+        while time_module.time() - start < timeout:
+            has_data = self.page.evaluate('''() => {
+                // Check standard HTML table cells
+                const tds = document.querySelectorAll('td');
+                for (const td of tds) {
+                    if (/^\\d{7}$/.test((td.innerText || '').trim())) return true;
+                }
+                // Check Dojo DataGrid cells
+                const gridCells = document.querySelectorAll('.dojoxGridCell');
+                for (const cell of gridCells) {
+                    if (/^\\d{7}$/.test((cell.innerText || '').trim())) return true;
+                }
+                return false;
+            }''')
+            if has_data:
+                logger.info("Invoice table data detected")
+                return True
+            time_module.sleep(0.5)
+        logger.warning("Timeout waiting for invoice table data")
+        return False
+
     def cache_invoice_search_results(self) -> list:
         """
         Scrape invoice search results table and return list of invoice info.
-        Portal uses unusual structure: each invoice row is in its own <table>.
+        Uses robust table detection by finding tables with 7-digit invoice IDs.
+        Column structure (0-indexed):
+          - Column 0: Checkbox
+          - Column 1: Invoice #
+          - Column 2: Service Code
+          - Column 3: Service M/Y
+          - Column 4: UCI#
+          - Column 5: Consumer Name
+          - Column 6+: Other fields (Invoice Date, etc.)
         """
         try:
-            invoices = self.page.evaluate('''() => {
-                const results = [];
-                let rowIndex = 0;
+            # First, wait for table data to be present
+            self._wait_for_invoice_table(timeout=10)
 
-                // Portal quirk: each invoice row is in its own <table>
-                // Scan ALL tables looking for rows that match invoice pattern
+            # Find and extract invoices using data-pattern detection (not header text)
+            result = self.page.evaluate('''() => {
+                const invoices = [];
                 const tables = document.querySelectorAll('table');
+                const debug = {
+                    tableCount: tables.length,
+                    tableSummary: [],
+                    bestTableIndex: -1,
+                    bestTableInvoiceCount: 0
+                };
 
-                for (const table of tables) {
+                // Find the table with the most invoice-like rows (7-digit IDs in column 1)
+                let bestTable = null;
+                let bestCount = 0;
+
+                for (let i = 0; i < tables.length; i++) {
+                    const table = tables[i];
                     const rows = table.querySelectorAll('tr');
+                    let invoiceRowCount = 0;
 
                     for (const row of rows) {
                         const cells = row.querySelectorAll('td');
-                        if (cells.length < 6) continue;
-
-                        // First cell with content should be Invoice# (7-digit number)
-                        // Find the first non-empty cell that looks like an invoice ID
-                        let invoiceId = '';
-                        let dataStartIdx = 0;
-
-                        for (let i = 0; i < Math.min(cells.length, 3); i++) {
-                            const text = cells[i]?.innerText?.trim() || '';
-                            if (/^\\d{6,8}$/.test(text)) {
-                                invoiceId = text;
-                                dataStartIdx = i;
-                                break;
+                        if (cells.length >= 6) {
+                            // Check if cell 1 looks like an invoice ID (7 digits)
+                            const cell1Text = cells[1]?.innerText?.trim() || '';
+                            if (/^\\d{7}$/.test(cell1Text)) {
+                                invoiceRowCount++;
                             }
                         }
+                    }
 
-                        if (!invoiceId) continue;
+                    debug.tableSummary.push({
+                        index: i,
+                        rowCount: rows.length,
+                        invoiceRowCount: invoiceRowCount
+                    });
 
-                        // Extract data relative to where we found the invoice ID
-                        const svcCode = cells[dataStartIdx + 1]?.innerText?.trim() || '';
-                        const svcMonth = cells[dataStartIdx + 2]?.innerText?.trim() || '';
-                        const uci = cells[dataStartIdx + 3]?.innerText?.trim() || '';
-                        const consumerName = cells[dataStartIdx + 4]?.innerText?.trim() || '';
-
-                        results.push({
-                            invoice_id: invoiceId,
-                            svc_code: svcCode,
-                            svc_month: svcMonth,
-                            uci: uci,
-                            consumer_name: consumerName,
-                            row_index: rowIndex,
-                            has_uci: uci.length > 0
-                        });
-                        rowIndex++;
+                    if (invoiceRowCount > bestCount) {
+                        bestCount = invoiceRowCount;
+                        bestTable = table;
+                        debug.bestTableIndex = i;
+                        debug.bestTableInvoiceCount = invoiceRowCount;
                     }
                 }
 
-                return results;
+                if (!bestTable) {
+                    return { invoices: invoices, debug: debug };
+                }
+
+                // Now extract data from the best table
+                const rows = bestTable.querySelectorAll('tr');
+                let rowIndex = 0;
+
+                for (const row of rows) {
+                    const cells = row.querySelectorAll('td');
+                    if (cells.length < 6) continue;
+
+                    const invoiceId = cells[1]?.innerText?.trim() || '';
+                    if (!/^\\d{7}$/.test(invoiceId)) continue;
+
+                    const svcCode = cells[2]?.innerText?.trim() || '';
+                    const svcMonth = cells[3]?.innerText?.trim() || '';
+                    const uci = cells[4]?.innerText?.trim() || '';
+                    const consumerName = cells[5]?.innerText?.trim() || '';
+
+                    // Basic validation
+                    if (!/^\\d+$/.test(svcCode)) continue;
+                    if (!svcMonth.includes('/')) continue;
+
+                    invoices.push({
+                        invoice_id: invoiceId,
+                        svc_code: svcCode,
+                        svc_month: svcMonth,
+                        uci: uci,
+                        consumer_name: consumerName,
+                        row_index: rowIndex,
+                        has_uci: uci.length > 0
+                    });
+                    rowIndex++;
+                }
+
+                return { invoices: invoices, debug: debug };
             }''')
 
-            logger.info(f"Cached {len(invoices)} invoice rows from search results")
+            # Extract debug info and invoices
+            debug_info = result.get('debug', {})
+            invoices = result.get('invoices', [])
+
+            # Log debug information
+            logger.info(f"Table detection: {debug_info.get('tableCount', 0)} tables found")
+            if debug_info.get('tableSummary'):
+                for ts in debug_info['tableSummary']:
+                    logger.info(f"  Table {ts['index']}: {ts['rowCount']} rows, {ts['invoiceRowCount']} invoice rows")
+            if debug_info.get('bestTableIndex', -1) >= 0:
+                logger.info(f"Selected table {debug_info['bestTableIndex']} with {debug_info['bestTableInvoiceCount']} invoice rows")
+            else:
+                logger.warning("No invoice table found in standard HTML tables, trying Dojo DataGrid...")
+
+            # Fallback: Dojo DataGrid (multi-view layout where each column is a separate view)
+            if not invoices:
+                invoices = self._scrape_invoices_from_dojo_grid()
+
+            logger.info(f"Found {len(invoices)} invoices in table")
             for inv in invoices:
-                logger.debug(f"  Invoice {inv['invoice_id']}: SVC={inv['svc_code']}, Month={inv['svc_month']}, UCI={inv['uci'] or '(multi)'}")
+                logger.info(f"  Invoice {inv['invoice_id']}: SVC={inv['svc_code']}, Month={inv['svc_month']}, UCI={inv['uci'] or '(multi)'}")
 
             return invoices
 
         except Exception as e:
             logger.error(f"Failed to cache invoice search results: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
+
+    def _scrape_visible_dojo_rows(self) -> list:
+        """Scrape currently visible invoice rows from Dojo DataGrid.
+        Each column lives in a separate 'view' div. We merge cells across
+        views by row index to reconstruct full rows."""
+        result = self.page.evaluate('''() => {
+            const views = document.querySelectorAll('.dojoxGridView');
+            if (!views.length) return { invoices: [], debug: 'no dojoxGridView found' };
+
+            // Collect cell texts from each view, organized by row
+            const viewData = [];
+            for (const view of views) {
+                const rows = view.querySelectorAll(
+                    '.dojoxGridContent .dojoxGridRow, .dojoxGridScrollbox .dojoxGridRow'
+                );
+                const rowTexts = [];
+                for (const row of rows) {
+                    const cells = row.querySelectorAll('.dojoxGridCell');
+                    const texts = Array.from(cells).map(c => (c.innerText || '').trim());
+                    rowTexts.push(texts);
+                }
+                viewData.push(rowTexts);
+            }
+
+            // Merge views into virtual rows (concatenate cells from each view)
+            const rowCount = Math.max(...viewData.map(v => v.length), 0);
+            const virtualRows = [];
+            for (let r = 0; r < rowCount; r++) {
+                const row = [];
+                for (const vd of viewData) {
+                    if (vd[r]) row.push(...vd[r]);
+                }
+                virtualRows.push(row);
+            }
+
+            // Find invoice rows: look for a 7-digit number in each virtual row
+            const invoices = [];
+            for (let r = 0; r < virtualRows.length; r++) {
+                const cells = virtualRows[r];
+                // Find the invoice ID cell (7 digits)
+                let idIdx = -1;
+                for (let c = 0; c < cells.length; c++) {
+                    if (/^\\d{7}$/.test(cells[c])) { idIdx = c; break; }
+                }
+                if (idIdx < 0) continue;
+
+                const invoiceId = cells[idIdx];
+                const svcCode = cells[idIdx + 1] || '';
+                const svcMonth = cells[idIdx + 2] || '';
+                const uci = cells[idIdx + 3] || '';
+                const consumerName = cells[idIdx + 4] || '';
+
+                // Validate: svcCode should be numeric, svcMonth should contain /
+                if (!/^\\d+$/.test(svcCode)) continue;
+                if (!svcMonth.includes('/')) continue;
+
+                invoices.push({
+                    invoice_id: invoiceId,
+                    svc_code: svcCode,
+                    svc_month: svcMonth,
+                    uci: uci,
+                    consumer_name: consumerName,
+                    row_index: r,
+                    has_uci: uci.length > 0
+                });
+            }
+
+            return {
+                invoices: invoices,
+                debug: {
+                    viewCount: views.length,
+                    rowCount: rowCount,
+                    sampleRow: virtualRows.length > 0 ? virtualRows[0].join(' | ') : '(empty)'
+                }
+            };
+        }''')
+        return result
+
+    def _scrape_invoices_from_dojo_grid(self) -> list:
+        """Scrape ALL invoice data from Dojo DataGrid by scrolling through
+        the virtual scroll container. The grid only renders ~30 rows at a
+        time, so we scroll down incrementally to render and capture all rows,
+        deduplicating by invoice_id."""
+        try:
+            all_invoices = {}  # keyed by invoice_id to deduplicate
+            max_scroll_iterations = 200  # safety limit
+
+            # Initial scrape of visible rows
+            result = self._scrape_visible_dojo_rows()
+            debug = result.get('debug', {})
+            logger.info(f"Dojo DataGrid initial scrape: {debug}")
+
+            for inv in result.get('invoices', []):
+                all_invoices[inv['invoice_id']] = inv
+
+            logger.info(f"Initial visible rows: {len(result.get('invoices', []))} invoices "
+                        f"({len(all_invoices)} unique)")
+
+            # Scroll loop: scroll the .dojoxGridScrollbox container down
+            for scroll_iter in range(max_scroll_iterations):
+                # Scroll down by one viewport height within the grid scrollbox
+                scroll_result = self.page.evaluate('''() => {
+                    // Find the scrollbox container(s) - pick the one with scrollable content
+                    const scrollboxes = document.querySelectorAll('.dojoxGridScrollbox');
+                    for (const sb of scrollboxes) {
+                        if (sb.scrollHeight > sb.clientHeight) {
+                            const prevTop = sb.scrollTop;
+                            sb.scrollTop += sb.clientHeight - 20;
+                            return {
+                                scrolled: sb.scrollTop !== prevTop,
+                                scrollTop: sb.scrollTop,
+                                clientHeight: sb.clientHeight,
+                                scrollHeight: sb.scrollHeight,
+                                atBottom: (sb.scrollTop + sb.clientHeight) >= (sb.scrollHeight - 5)
+                            };
+                        }
+                    }
+                    return { scrolled: false, atBottom: true, noScrollbox: true };
+                }''')
+
+                if not scroll_result.get('scrolled', False):
+                    logger.info(f"Scroll loop done: no more scrolling possible "
+                                f"(iter {scroll_iter + 1})")
+                    break
+
+                # Wait for virtual rows to re-render after scroll
+                time.sleep(1.0)
+
+                # Scrape newly visible rows
+                result = self._scrape_visible_dojo_rows()
+                new_count = 0
+                for inv in result.get('invoices', []):
+                    if inv['invoice_id'] not in all_invoices:
+                        all_invoices[inv['invoice_id']] = inv
+                        new_count += 1
+
+                if scroll_iter % 10 == 0 or new_count > 0:
+                    logger.info(f"Scroll iter {scroll_iter + 1}: "
+                                f"+{new_count} new invoices, "
+                                f"{len(all_invoices)} total unique, "
+                                f"scrollTop={scroll_result.get('scrollTop', '?')}/"
+                                f"{scroll_result.get('scrollHeight', '?')}")
+
+                # Stop if we've reached the bottom
+                if scroll_result.get('atBottom', False):
+                    logger.info(f"Reached bottom of grid after {scroll_iter + 1} scroll(s)")
+                    break
+
+            invoices = list(all_invoices.values())
+            logger.info(f"Dojo DataGrid total: {len(invoices)} unique invoices "
+                        f"(after scroll + dedup)")
+            return invoices
+
+        except Exception as e:
+            logger.error(f"Dojo DataGrid invoice scrape failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
 
     def _click_next_page(self) -> bool:
@@ -759,9 +1248,28 @@ class DDSeBillingBot:
             # Debug: Log page structure before scraping (first page only)
             if page_num == 1:
                 self._debug_page_structure()
+                self._screenshot("invoice_search_before_scrape")
 
-            # Scrape current page
+            # Scrape current page with retry on first page
             page_invoices = self.cache_invoice_search_results()
+
+            # On first page, if no invoices found, wait and retry
+            if not page_invoices and page_num == 1:
+                logger.warning("No invoices found on first attempt, waiting and retrying...")
+                time.sleep(3)
+                self._screenshot("invoice_search_retry")
+                page_invoices = self.cache_invoice_search_results()
+
+                if not page_invoices:
+                    logger.error("Still no invoices found after retry. Taking debug screenshot.")
+                    self._screenshot("no_invoices_found_debug")
+                    # Log the full page HTML for debugging
+                    try:
+                        html_preview = self.page.evaluate('() => document.body.innerHTML.substring(0, 2000)')
+                        logger.error(f"Page HTML preview: {html_preview}")
+                    except:
+                        pass
+                    break
 
             if not page_invoices:
                 break
@@ -881,14 +1389,18 @@ class DDSeBillingBot:
 
             logger.info(f"Expanding folder: Invoice {invoice_id}, SVC={svc_code}, Month={svc_month}")
 
-            # Click EDIT on this folder row to open it
-            if not self.open_invoice_details(None, service_month_year=svc_month, svc_code=svc_code):
-                logger.warning(f"Could not open folder {invoice_id}")
-                return []
+            # Check cache first to avoid unnecessary click
+            if invoice_id and invoice_id in self._multi_consumer_cache:
+                logger.info(f"Using cached contents for invoice {invoice_id}")
+                consumers = self._multi_consumer_cache[invoice_id]
+            else:
+                # Click EDIT on this folder row to open it
+                if not self.open_invoice_details(None, service_month_year=svc_month, svc_code=svc_code, invoice_id=invoice_id):
+                    logger.warning(f"Could not open folder {invoice_id}")
+                    return []
 
-            # Now we're in the invoice view - scrape consumer lines
-            # Uses existing cache_multi_consumer_invoice_contents() method
-            consumers = self.cache_multi_consumer_invoice_contents(svc_code, svc_month)
+                # Now we're in the invoice view - scrape consumer lines
+                consumers = self.cache_multi_consumer_invoice_contents(svc_code, svc_month, invoice_id=invoice_id)
 
             # Convert to inventory format
             invoices = []
@@ -910,7 +1422,7 @@ class DDSeBillingBot:
             logger.error(f"Error expanding folder: {e}")
             return []
 
-    def cache_multi_consumer_invoice_contents(self, svc_code: str, svc_month_year: str) -> List[Dict]:
+    def cache_multi_consumer_invoice_contents(self, svc_code: str, svc_month_year: str, invoice_id: str = '') -> List[Dict]:
         """
         Scrape the currently open invoice view to cache all consumer lines.
         Called when we first enter a multi-consumer invoice to remember what's inside.
@@ -918,14 +1430,14 @@ class DDSeBillingBot:
         Returns list of dicts: {line_number, consumer_name, uci, svc_code, svc_subcode, auth_number}
         """
         try:
-            invoice_key = (svc_code, svc_month_year)
+            invoice_key = invoice_id or (svc_code, svc_month_year)
 
             # Check if already cached
             if invoice_key in self._multi_consumer_cache:
                 logger.info(f"Using cached contents for invoice {invoice_key}")
                 return self._multi_consumer_cache[invoice_key]
 
-            logger.info(f"Caching multi-consumer invoice contents: SVC={svc_code}, Month={svc_month_year}")
+            logger.info(f"Caching multi-consumer invoice contents: invoice_id={invoice_id}, SVC={svc_code}, Month={svc_month_year}")
 
             consumers = self.page.evaluate('''() => {
                 const results = [];
@@ -981,19 +1493,46 @@ class DDSeBillingBot:
             logger.error(f"Failed to cache multi-consumer invoice contents: {e}")
             return []
 
-    def open_invoice_details(self, consumer_name: str, service_month_year: str = None, uci: str = None, svc_code: str = None) -> bool:
+    def open_invoice_details(self, consumer_name: str, service_month_year: str = None, uci: str = None, svc_code: str = None, invoice_id: str = None) -> bool:
         """
         Click EDIT to open invoice details, matching by UCI + Service Code + Service M/Y.
         Falls back to multi-consumer invoice matching if direct match not found.
         """
         try:
-            logger.info(f"Opening invoice: UCI={uci}, SVC={svc_code}, Month={service_month_year}")
+            logger.info(f"Opening invoice: Invoice={invoice_id}, UCI={uci}, SVC={svc_code}, Month={service_month_year}")
             self._screenshot("09_before_edit_click")
 
             clicked = False
 
+            # Method 0: Match by invoice_id (most precise — used by folder expansion)
+            if invoice_id:
+                result = self.page.evaluate(f'''() => {{
+                    const rows = document.querySelectorAll('tr');
+                    for (const row of rows) {{
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length < 6) continue;
+                        const rowInvoiceId = cells[1]?.innerText?.trim() || '';
+                        if (rowInvoiceId === '{invoice_id}') {{
+                            const editLink = row.querySelector('a[href*="edit"], a img, img[src*="edit"]');
+                            if (editLink) {{
+                                editLink.click();
+                                return 'clicked invoice ' + rowInvoiceId;
+                            }}
+                            const lastCell = cells[cells.length - 1];
+                            const editInLast = lastCell.querySelector('a, img');
+                            if (editInLast) {{
+                                editInLast.click();
+                                return 'clicked invoice ' + rowInvoiceId + ' via last cell';
+                            }}
+                        }}
+                    }}
+                    return 'no match for invoice_id {invoice_id}';
+                }}''')
+                logger.info(f"Invoice ID match result: {result}")
+                clicked = 'clicked' in result
+
             # Method 1: Find row matching UCI + Service Code + Service M/Y (single-consumer invoice)
-            if uci and service_month_year:
+            if not clicked and uci and service_month_year:
                 svc = svc_code or ''
                 result = self.page.evaluate(f'''() => {{
                     // Normalize month format: "8/2025" -> "08/2025"
@@ -1766,7 +2305,7 @@ class DDSeBillingBot:
                         )
                         if search_match and not search_match.get('has_uci', True):
                             # This is a multi-consumer invoice - cache contents for efficiency
-                            self.cache_multi_consumer_invoice_contents(svc_code, service_month)
+                            self.cache_multi_consumer_invoice_contents(svc_code, service_month, invoice_id=search_match.get('invoice_id', ''))
                 else:
                     # Subsequent records: Invoice is already open, skip navigation
                     if invoice_opened_successfully:
@@ -1867,10 +2406,10 @@ def submit_to_ebilling(records: List[Dict], username: str, password: str,
 def scrape_invoice_inventory(username: str, password: str,
                              regional_center: str = "ELARC",
                              portal_url: str = None,
-                             provider_id: str = None) -> List[Dict]:
+                             provider_id: str = None) -> Dict:
     """
     Scrape all available invoices from portal without submitting anything.
-    Returns list of invoice records with consumer details.
+    Returns structured dict with status and invoice records.
 
     For multi-consumer folders (no UCI in search), clicks into each to get
     individual consumer invoices.
@@ -1883,30 +2422,65 @@ def scrape_invoice_inventory(username: str, password: str,
         provider_id: Provider ID to select (if None, selects first available)
 
     Returns:
-        List of dicts with keys: invoice_id, last_name, first_name, uci, service_month, svc_code
+        Dict with keys:
+            status: 'success' or 'error'
+            invoices: List of invoice dicts (on success)
+            error: Error type string (on error)
+            message: Human-readable error message (on error)
     """
     with DDSeBillingBot(username, password, headless=None,
                         regional_center=regional_center, portal_url=portal_url) as bot:
         if not bot.login():
             logger.error("Login failed for inventory scrape")
-            return []
+            return {
+                'status': 'error',
+                'error': 'login_failed',
+                'message': 'Could not log in to the RC portal. Check your username and password in Settings.'
+            }
+
+        password_expiry_days = bot.password_expiry_days
 
         # Select provider (use provided ID or first available)
         if provider_id:
             if not bot.select_provider(provider_id):
                 logger.error(f"Could not select provider: {provider_id}")
-                return []
+                return {
+                    'status': 'error',
+                    'error': 'provider_not_found',
+                    'message': f'Provider "{provider_id}" is not associated with this login on the RC portal. Check your SPN ID in Settings.'
+                }
         else:
             if not bot.select_first_provider():
                 logger.error("Could not select first provider")
-                return []
+                return {
+                    'status': 'error',
+                    'error': 'provider_not_found',
+                    'message': 'No providers found on the RC portal for this login.'
+                }
 
         if not bot.navigate_to_invoices():
             logger.error("Could not navigate to invoices")
-            return []
+            return {
+                'status': 'error',
+                'error': 'navigation_failed',
+                'message': 'Could not navigate to the Invoices page on the RC portal.'
+            }
 
         # Scrape search results (includes both single-consumer and folder rows)
         search_results = bot.scrape_all_invoice_pages()
+
+        logger.info(f"=== Search Results: Found {len(search_results)} invoice rows ===")
+        if not search_results:
+            logger.warning("No invoices found in search results!")
+            bot._screenshot("no_invoices_final")
+            result = {'status': 'success', 'invoices': []}
+            if password_expiry_days is not None:
+                result['warnings'] = [f'Your eBilling portal password will expire in {password_expiry_days} days. Please change it soon.']
+            return result
+
+        for inv in search_results:
+            logger.info(f"  Found: Invoice#{inv.get('invoice_id')} SVC={inv.get('svc_code')} "
+                       f"Month={inv.get('svc_month')} UCI={inv.get('uci') or '(multi-consumer)'}")
 
         expanded_invoices = []
 
@@ -1931,4 +2505,151 @@ def scrape_invoice_inventory(username: str, password: str,
                 bot.navigate_to_invoices()
 
         logger.info(f"Inventory scrape complete: {len(expanded_invoices)} total invoices")
-        return expanded_invoices
+        result = {'status': 'success', 'invoices': expanded_invoices}
+        if password_expiry_days is not None:
+            result['warnings'] = [f'Your eBilling portal password will expire in {password_expiry_days} days. Please change it soon.']
+        return result
+
+
+def get_portal_providers(username: str, password: str,
+                         regional_center: str = "ELARC",
+                         portal_url: str = None) -> Dict:
+    """
+    Log in to the RC portal and scrape the list of providers available for this login.
+
+    Returns:
+        Dict with keys:
+            status: 'success' or 'error'
+            providers: List of {'spn_id': 'XX1234', 'name': '...'} dicts (on success)
+            error/message: Error info (on error)
+    """
+    with DDSeBillingBot(username, password, headless=None,
+                        regional_center=regional_center, portal_url=portal_url) as bot:
+        if not bot.login():
+            return {
+                'status': 'error',
+                'error': 'login_failed',
+                'message': 'Could not log in to the RC portal. Check your username and password in Settings.'
+            }
+
+        password_expiry_days = bot.password_expiry_days
+
+        providers = bot.get_available_providers()
+
+        if not providers:
+            return {
+                'status': 'error',
+                'error': 'no_providers',
+                'message': 'No providers found on the RC portal for this login.'
+            }
+
+        result = {'status': 'success', 'providers': providers}
+        if password_expiry_days is not None:
+            result['warnings'] = [f'Your eBilling portal password will expire in {password_expiry_days} days. Please change it soon.']
+        return result
+
+
+def scrape_all_providers_inventory(username: str, password: str,
+                                   regional_center: str = "ELARC",
+                                   portal_url: str = None) -> Dict:
+    """
+    Scan all providers on an RC login and return combined invoice inventory.
+
+    Uses a single login session to iterate through all providers, avoiding
+    multiple logins that trigger portal session conflicts.
+
+    Returns:
+        Dict with keys:
+            status: 'success' or 'error'
+            invoices: Combined list of invoice dicts, each tagged with 'provider_spn'
+            providers_scanned: List of {'spn_id': ..., 'name': ...} that were scanned
+            error/message: Error info (on error)
+    """
+    with DDSeBillingBot(username, password, headless=None,
+                        regional_center=regional_center, portal_url=portal_url) as bot:
+        if not bot.login():
+            return {
+                'status': 'error',
+                'error': 'login_failed',
+                'message': 'Could not log in to the RC portal. Check your username and password in Settings.'
+            }
+        password_expiry_days = bot.password_expiry_days
+
+        providers = bot.get_available_providers()
+        if not providers:
+            return {
+                'status': 'error',
+                'error': 'no_providers',
+                'message': 'No providers found on the RC portal for this login.'
+            }
+
+        all_invoices = []
+        providers_scanned = []
+
+        for i, prov in enumerate(providers):
+            spn_id = prov['spn_id']
+            logger.info(f"Scanning provider {spn_id} ({prov['name']})...")
+
+            if not bot.select_provider(spn_id):
+                logger.warning(f"Could not select provider {spn_id}, skipping")
+                providers_scanned.append(prov)
+                bot.navigate_to_provider_selection()
+                continue
+
+            if not bot.navigate_to_invoices():
+                logger.warning(f"Could not navigate to invoices for {spn_id}, skipping")
+                providers_scanned.append(prov)
+                bot.navigate_to_provider_selection()
+                continue
+
+            # Scrape search results (includes both single-consumer and folder rows)
+            search_results = bot.scrape_all_invoice_pages()
+            logger.info(f"  Search results: {len(search_results)} invoice rows for {spn_id}")
+
+            expanded_invoices = []
+            for inv in search_results:
+                if inv.get('has_uci'):
+                    # Single consumer invoice - parse name directly
+                    name_parts = inv.get('consumer_name', '').split(',')
+                    expanded_invoices.append({
+                        'invoice_id': inv.get('invoice_id', ''),
+                        'last_name': name_parts[0].strip() if name_parts else '',
+                        'first_name': name_parts[1].strip() if len(name_parts) > 1 else '',
+                        'uci': inv.get('uci', ''),
+                        'service_month': inv.get('svc_month', ''),
+                        'svc_code': inv.get('svc_code', '')
+                    })
+                else:
+                    # Multi-consumer FOLDER - click into it to get individual invoices
+                    folder_invoices = bot.expand_multi_consumer_folder(inv)
+                    expanded_invoices.extend(folder_invoices)
+                    # Navigate back to search results for next folder
+                    bot.navigate_to_invoices()
+
+            # Tag each invoice with provider info
+            for inv in expanded_invoices:
+                inv['provider_spn'] = spn_id
+                inv['provider_name'] = prov['name']
+            all_invoices.extend(expanded_invoices)
+            providers_scanned.append(prov)
+            logger.info(f"  Found {len(expanded_invoices)} invoices for {spn_id}")
+
+            # Navigate back to provider selection for next provider
+            if i < len(providers) - 1:
+                if not bot.navigate_to_provider_selection():
+                    logger.warning(f"Failed to navigate back after {spn_id}, retrying...")
+                    # Retry once — click Home then Dashboard
+                    time.sleep(2)
+                    if not bot.navigate_to_provider_selection():
+                        logger.error(f"Cannot navigate back to provider selection after {spn_id}")
+                        break
+
+    logger.info(f"All-providers scan complete: {len(all_invoices)} total invoices from {len(providers_scanned)} providers")
+    result = {
+        'status': 'success',
+        'invoices': all_invoices,
+        'providers_scanned': providers_scanned
+    }
+    if password_expiry_days is not None:
+        result['warnings'] = [f'Your eBilling portal password will expire in {password_expiry_days} days. Please change it soon.']
+    return result

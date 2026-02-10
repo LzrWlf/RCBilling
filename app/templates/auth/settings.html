@@ -21,7 +21,7 @@
                         </div>
                         <div class="col-md-2">
                             <label class="form-label">SPN ID</label>
-                            <input type="text" class="form-control" name="spn_id" placeholder="PP0212">
+                            <input type="text" class="form-control" name="spn_id" placeholder="PP0212" required>
                             <small class="text-muted">Service Provider #</small>
                         </div>
                         <div class="col-md-2">
@@ -104,7 +104,7 @@
                                             <input type="text" class="form-control form-control-sm" name="name" value="{{ p.name }}" placeholder="Provider Name">
                                         </div>
                                         <div class="col-md-2">
-                                            <input type="text" class="form-control form-control-sm" name="spn_id" value="{{ p.spn_id or '' }}" placeholder="SPN ID (e.g. PP0212)">
+                                            <input type="text" class="form-control form-control-sm" name="spn_id" value="{{ p.spn_id or '' }}" placeholder="SPN ID (e.g. PP0212)" required>
                                         </div>
                                         <div class="col-md-2">
                                             <select class="form-select form-select-sm" name="regional_center">

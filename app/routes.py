@@ -6,7 +6,7 @@ import csv
 import io
 from datetime import datetime
 from app.csv_parser import parse_rc_billing_csv, records_to_dict
-from app.automation.dds_ebilling import submit_to_ebilling, scrape_invoice_inventory
+from app.automation.dds_ebilling import submit_to_ebilling, scrape_invoice_inventory, scrape_all_providers_inventory
 from app.models import db, Provider, SubmissionLog
 
 _last_submission_results = {}
@@ -310,14 +310,22 @@ def get_available_invoices():
 
     try:
         # Call inventory-only function with SPN ID for provider selection
-        # SPN ID (e.g., PP0212) is more reliable than name for selection
-        inventory = scrape_invoice_inventory(
+        result = scrape_invoice_inventory(
             username=username,
             password=password,
             regional_center=provider.regional_center,
             portal_url=provider.rc_portal_url,
-            provider_id=provider.spn_id or provider.name  # Prefer SPN ID, fall back to name
+            provider_id=provider.spn_id
         )
+
+        if result['status'] != 'success':
+            flash(result['message'], 'error')
+            return redirect(url_for('main.index'))
+
+        for w in result.get('warnings', []):
+            flash(w, 'warning')
+
+        inventory = result['invoices']
 
         # Store for download
         _last_available_invoices[current_user.id] = {
@@ -361,13 +369,18 @@ def get_available_invoices_ajax():
 
     try:
         # Use SPN ID from the CSV for provider selection
-        inventory = scrape_invoice_inventory(
+        result = scrape_invoice_inventory(
             username=username,
             password=password,
             regional_center=provider.regional_center,
             portal_url=provider.rc_portal_url,
             provider_id=spn_id  # Use SPN ID from CSV
         )
+
+        if result['status'] != 'success':
+            return jsonify({'status': 'error', 'message': result['message']})
+
+        inventory = result['invoices']
 
         # Store for download
         _last_available_invoices[current_user.id] = {
@@ -379,11 +392,70 @@ def get_available_invoices_ajax():
         return jsonify({
             'status': 'success',
             'invoices': inventory,
-            'count': len(inventory)
+            'count': len(inventory),
+            'warnings': result.get('warnings', [])
         })
 
     except Exception as e:
         return jsonify({'status': 'error', 'message': f'Error scraping invoices: {str(e)}'})
+
+
+@main_bp.route('/available-invoices-all', methods=['POST'])
+@login_required
+def get_available_invoices_all():
+    """Scan all providers on an RC login and return combined invoice inventory"""
+    global _last_available_invoices
+
+    provider_id = request.form.get('provider_id')
+    if not provider_id:
+        flash('Please select a provider', 'error')
+        return redirect(url_for('main.index'))
+
+    provider = Provider.query.get(provider_id)
+    if not provider or provider.user_id != current_user.id:
+        flash('Invalid provider selection', 'error')
+        return redirect(url_for('main.index'))
+
+    username, password = provider.get_credentials()
+    if not username or not password:
+        flash(f'No credentials for {provider.regional_center}. Go to Settings.', 'error')
+        return redirect(url_for('main.index'))
+
+    try:
+        result = scrape_all_providers_inventory(
+            username=username,
+            password=password,
+            regional_center=provider.regional_center,
+            portal_url=provider.rc_portal_url
+        )
+
+        if result['status'] != 'success':
+            flash(result['message'], 'error')
+            return redirect(url_for('main.index'))
+
+        for w in result.get('warnings', []):
+            flash(w, 'warning')
+
+        inventory = result['invoices']
+        providers_scanned = result.get('providers_scanned', [])
+
+        # Store for download
+        _last_available_invoices[current_user.id] = {
+            'timestamp': datetime.now(),
+            'provider_name': provider.name,
+            'invoices': inventory
+        }
+
+        flash(f'Scanned {len(providers_scanned)} providers, found {len(inventory)} invoices', 'success')
+        return render_template('available_invoices.html',
+                               invoices=inventory,
+                               provider=provider,
+                               providers_scanned=providers_scanned,
+                               scan_all=True)
+
+    except Exception as e:
+        flash(f'Error scraping invoices: {str(e)}', 'error')
+        return redirect(url_for('main.index'))
 
 
 @main_bp.route('/download-available-invoices')
@@ -399,10 +471,19 @@ def download_available_invoices():
     output = io.StringIO()
     writer = csv.writer(output)
 
-    writer.writerow(['Last Name', 'First Name', 'UCI', 'Service Month', 'Service Code', 'Invoice ID'])
+    # Include Provider SPN column if any invoice has it (all-providers scan)
+    has_provider_spn = any(inv.get('provider_spn') for inv in user_results['invoices'])
+
+    if has_provider_spn:
+        writer.writerow(['Provider SPN', 'Last Name', 'First Name', 'UCI', 'Service Month', 'Service Code', 'Invoice ID'])
+    else:
+        writer.writerow(['Last Name', 'First Name', 'UCI', 'Service Month', 'Service Code', 'Invoice ID'])
 
     for inv in user_results['invoices']:
-        writer.writerow([
+        row = []
+        if has_provider_spn:
+            row.append(inv.get('provider_spn', ''))
+        row.extend([
             inv.get('last_name', ''),
             inv.get('first_name', ''),
             inv.get('uci', ''),
@@ -410,6 +491,7 @@ def download_available_invoices():
             inv.get('svc_code', ''),
             inv.get('invoice_id', '')
         ])
+        writer.writerow(row)
 
     output.seek(0)
     return Response(
