@@ -1507,6 +1507,7 @@ class DDSeBillingBot:
             # Method 0: Match by invoice_id (most precise — used by folder expansion)
             if invoice_id:
                 result = self.page.evaluate(f'''() => {{
+                    // Try standard HTML <tr> rows first
                     const rows = document.querySelectorAll('tr');
                     for (const row of rows) {{
                         const cells = row.querySelectorAll('td');
@@ -1526,6 +1527,49 @@ class DDSeBillingBot:
                             }}
                         }}
                     }}
+
+                    // Try Dojo DataGrid: rows split across multiple views
+                    const views = document.querySelectorAll('.dojoxGridView');
+                    if (views.length > 0) {{
+                        // Find which row index contains our invoice_id
+                        let targetIdx = -1;
+                        for (const view of views) {{
+                            const dRows = view.querySelectorAll(
+                                '.dojoxGridContent .dojoxGridRow, .dojoxGridScrollbox .dojoxGridRow'
+                            );
+                            for (let r = 0; r < dRows.length; r++) {{
+                                const cells = dRows[r].querySelectorAll('.dojoxGridCell');
+                                for (const cell of cells) {{
+                                    if ((cell.innerText || '').trim() === '{invoice_id}') {{
+                                        targetIdx = r;
+                                        break;
+                                    }}
+                                }}
+                                if (targetIdx >= 0) break;
+                            }}
+                            if (targetIdx >= 0) break;
+                        }}
+
+                        if (targetIdx >= 0) {{
+                            // Find the edit button at this row index in any view
+                            for (const view of views) {{
+                                const dRows = view.querySelectorAll(
+                                    '.dojoxGridContent .dojoxGridRow, .dojoxGridScrollbox .dojoxGridRow'
+                                );
+                                if (targetIdx < dRows.length) {{
+                                    const row = dRows[targetIdx];
+                                    const editImg = row.querySelector('img[src*="edit" i]')
+                                        || row.querySelector('a[href*="edit"] img')
+                                        || row.querySelector('a img');
+                                    if (editImg) {{
+                                        editImg.click();
+                                        return 'clicked dojo invoice {invoice_id} at row ' + targetIdx;
+                                    }}
+                                }}
+                            }}
+                        }}
+                    }}
+
                     return 'no match for invoice_id {invoice_id}';
                 }}''')
                 logger.info(f"Invoice ID match result: {result}")
@@ -2485,24 +2529,10 @@ def scrape_invoice_inventory(username: str, password: str,
         expanded_invoices = []
 
         for inv in search_results:
-            if inv.get('has_uci'):
-                # Single consumer invoice - parse name directly
-                name_parts = inv.get('consumer_name', '').split(',')
-                expanded_invoices.append({
-                    'invoice_id': inv.get('invoice_id', ''),
-                    'last_name': name_parts[0].strip() if name_parts else '',
-                    'first_name': name_parts[1].strip() if len(name_parts) > 1 else '',
-                    'uci': inv.get('uci', ''),
-                    'service_month': inv.get('svc_month', ''),
-                    'svc_code': inv.get('svc_code', '')
-                })
-            else:
-                # Multi-consumer FOLDER - click into it to get individual invoices
-                folder_invoices = bot.expand_multi_consumer_folder(inv)
-                expanded_invoices.extend(folder_invoices)
-
-                # Navigate back to search results for next folder
-                bot.navigate_to_invoices()
+            # ALL invoices may contain multiple SVC subcode lines inside
+            folder_invoices = bot.expand_multi_consumer_folder(inv)
+            expanded_invoices.extend(folder_invoices)
+            bot.navigate_to_invoices()
 
         logger.info(f"Inventory scrape complete: {len(expanded_invoices)} total invoices")
         result = {'status': 'success', 'invoices': expanded_invoices}
@@ -2608,23 +2638,10 @@ def scrape_all_providers_inventory(username: str, password: str,
 
             expanded_invoices = []
             for inv in search_results:
-                if inv.get('has_uci'):
-                    # Single consumer invoice - parse name directly
-                    name_parts = inv.get('consumer_name', '').split(',')
-                    expanded_invoices.append({
-                        'invoice_id': inv.get('invoice_id', ''),
-                        'last_name': name_parts[0].strip() if name_parts else '',
-                        'first_name': name_parts[1].strip() if len(name_parts) > 1 else '',
-                        'uci': inv.get('uci', ''),
-                        'service_month': inv.get('svc_month', ''),
-                        'svc_code': inv.get('svc_code', '')
-                    })
-                else:
-                    # Multi-consumer FOLDER - click into it to get individual invoices
-                    folder_invoices = bot.expand_multi_consumer_folder(inv)
-                    expanded_invoices.extend(folder_invoices)
-                    # Navigate back to search results for next folder
-                    bot.navigate_to_invoices()
+                # ALL invoices may contain multiple SVC subcode lines inside
+                folder_invoices = bot.expand_multi_consumer_folder(inv)
+                expanded_invoices.extend(folder_invoices)
+                bot.navigate_to_invoices()
 
             # Tag each invoice with provider info
             for inv in expanded_invoices:
