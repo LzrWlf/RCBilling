@@ -59,17 +59,12 @@ def settings():
 def add_provider():
     """Add a new provider"""
     name = request.form.get('name', '').strip()
-    spn_id = request.form.get('spn_id', '').strip().upper()  # SPN IDs are uppercase
     regional_center = request.form.get('regional_center', '').strip()
     username = request.form.get('username', '').strip()
     password = request.form.get('password', '').strip()
 
     if not name:
         flash('Provider name is required', 'error')
-        return redirect(url_for('auth.settings'))
-
-    if not spn_id:
-        flash('SPN ID (Service Provider Number) is required', 'error')
         return redirect(url_for('auth.settings'))
 
     if not regional_center or regional_center not in REGIONAL_CENTERS:
@@ -79,7 +74,6 @@ def add_provider():
     provider = Provider(
         user_id=current_user.id,
         name=name,
-        spn_id=spn_id,
         regional_center=regional_center
     )
 
@@ -103,17 +97,12 @@ def update_provider(provider_id):
         return redirect(url_for('auth.settings'))
 
     name = request.form.get('name', '').strip()
-    spn_id = request.form.get('spn_id', '').strip().upper()  # SPN IDs are uppercase
     regional_center = request.form.get('regional_center', '').strip()
     username = request.form.get('username', '').strip()
     password = request.form.get('password', '').strip()
 
     if name:
         provider.name = name
-    if not spn_id:
-        flash('SPN ID (Service Provider Number) is required', 'error')
-        return redirect(url_for('auth.settings'))
-    provider.spn_id = spn_id
     if regional_center and regional_center in REGIONAL_CENTERS:
         provider.regional_center = regional_center
 

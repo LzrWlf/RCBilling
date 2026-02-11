@@ -45,6 +45,8 @@
                                 <th>UCI</th>
                                 <th>Service Month</th>
                                 <th>Service Code</th>
+                                <th>SVC Subcode</th>
+                                <th>Auth #</th>
                                 <th>Invoice ID</th>
                             </tr>
                         </thead>
@@ -57,6 +59,8 @@
                                 <td><code>{{ inv.uci }}</code></td>
                                 <td>{{ inv.service_month }}</td>
                                 <td>{{ inv.svc_code }}</td>
+                                <td>{{ inv.svc_subcode }}</td>
+                                <td><small>{{ inv.auth_number }}</small></td>
                                 <td><small class="text-muted">{{ inv.invoice_id }}</small></td>
                             </tr>
                             {% endfor %}

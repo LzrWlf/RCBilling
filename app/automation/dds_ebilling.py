@@ -23,6 +23,8 @@ from collections import defaultdict
 import logging
 import time
 import os
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -1405,11 +1407,11 @@ class DDSeBillingBot:
             # Convert to inventory format
             invoices = []
             for c in consumers:
-                name_parts = c.get('consumer_name', '').split(',')
+                name_words = c.get('consumer_name', '').strip().split()
                 invoices.append({
                     'invoice_id': invoice_id,
-                    'last_name': name_parts[0].strip() if name_parts else '',
-                    'first_name': name_parts[1].strip() if len(name_parts) > 1 else '',
+                    'last_name': ' '.join(name_words[:-1]) if len(name_words) > 1 else (name_words[0] if name_words else ''),
+                    'first_name': name_words[-1] if len(name_words) > 1 else '',
                     'uci': c.get('uci', ''),
                     'service_month': svc_month,
                     'svc_code': c.get('svc_code', svc_code),
@@ -2791,6 +2793,216 @@ def scrape_all_providers_inventory(username: str, password: str,
                         break
 
     logger.info(f"All-providers scan complete: {len(all_invoices)} total invoices from {len(providers_scanned)} providers")
+    result = {
+        'status': 'success',
+        'invoices': all_invoices,
+        'providers_scanned': providers_scanned
+    }
+    if password_expiry_days is not None:
+        result['warnings'] = [f'Your eBilling portal password will expire in {password_expiry_days} days. Please change it soon.']
+    return result
+
+
+def scrape_all_providers_inventory_fast(username: str, password: str,
+                                        regional_center: str = "ELARC",
+                                        portal_url: str = None) -> Dict:
+    """
+    Fast invoice scraper using direct HTTP requests to JSON API endpoints.
+
+    Uses Playwright ONLY for login (popup window + JS-heavy flow), then
+    switches to requests.Session() with the session cookie to hit the
+    portal's JSON grid endpoints directly. ~10x faster than the DOM-based scraper.
+
+    Returns same structure as scrape_all_providers_inventory():
+        Dict with keys:
+            status: 'success' or 'error'
+            invoices: Combined list of invoice dicts, each tagged with 'provider_spn'
+            providers_scanned: List of {'spn_id': ..., 'name': ...} that were scanned
+            error/message: Error info (on error)
+    """
+    import requests as req
+
+    # --- Phase 1: Login via Playwright to get session cookie ---
+    # Do NOT use 'with' block — we need to close browser WITHOUT logging out,
+    # so the PHPSESSID remains valid for our HTTP requests.
+    bot = DDSeBillingBot(username, password, headless=None,
+                         regional_center=regional_center, portal_url=portal_url)
+    bot.start()
+    try:
+        if not bot.login():
+            bot.stop()
+            return {
+                'status': 'error',
+                'error': 'login_failed',
+                'message': 'Could not log in to the RC portal. Check your username and password in Settings.'
+            }
+        password_expiry_days = bot.password_expiry_days
+
+        # Extract session cookie from browser context
+        cookies = bot.context.cookies()
+        session_cookie = None
+        for c in cookies:
+            if c['name'] == 'PHPSESSID':
+                session_cookie = c['value']
+                break
+
+        if not session_cookie:
+            bot.stop()
+            return {
+                'status': 'error',
+                'error': 'no_session',
+                'message': 'Could not extract session cookie after login.'
+            }
+
+        # Determine base URL from the portal URL
+        base_url = bot.portal_url.rsplit('/login', 1)[0]
+        logger.info(f"Fast scraper: base_url={base_url}, PHPSESSID={session_cookie[:8]}...")
+    finally:
+        # Close browser WITHOUT logging out — keeps session cookie valid
+        if bot.browser:
+            bot.browser.close()
+        if bot.playwright:
+            bot.playwright.stop()
+        logger.info("Browser closed (no logout — session preserved)")
+
+    # --- Phase 2: Direct HTTP requests using session cookie ---
+    session = req.Session()
+    session.cookies.set('PHPSESSID', session_cookie, domain='ebilling.dds.ca.gov')
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': f'{base_url}/home/dashboard',
+    })
+    # Disable SSL verification for the portal's custom port
+    session.verify = False
+
+    try:
+        # Step 1: Get providers list
+        resp = session.get(f'{base_url}/home/dashboardspngrid', timeout=30)
+        resp.raise_for_status()
+        logger.info(f"  dashboardspngrid response: {resp.status_code}, {len(resp.text)} bytes")
+        if not resp.text or resp.text[0] != '{':
+            logger.error(f"  Unexpected response (not JSON): {resp.text[:200]}")
+            return {
+                'status': 'error',
+                'error': 'session_invalid',
+                'message': 'Session cookie may be invalid. Got non-JSON response from portal.'
+            }
+        providers_data = resp.json()
+        providers_items = providers_data.get('items', [])
+
+        if not providers_items:
+            return {
+                'status': 'error',
+                'error': 'no_providers',
+                'message': 'No providers found on the RC portal for this login.'
+            }
+
+        providers = []
+        for p in providers_items:
+            providers.append({
+                'spn_id': p.get('SPNCD', ''),
+                'name': p.get('DESC', ''),
+                '_internal_id': p.get('SPNID', ''),  # Internal ID needed for setspn
+            })
+        logger.info(f"Fast scraper: found {len(providers)} providers")
+
+        all_invoices = []
+        providers_scanned = []
+
+        for i, prov in enumerate(providers):
+            spn_id = prov['spn_id']
+            internal_id = prov['_internal_id']
+            logger.info(f"Fast scraper: scanning provider {spn_id} ({prov['name']})...")
+
+            # Step 2: Select provider via POST
+            resp = session.post(
+                f'{base_url}/home/setspn',
+                data={
+                    'SPNSelID': internal_id,
+                    'SPNSelCD': '',
+                    'SPNSelDesc': '',
+                    'downloadid': '',
+                },
+                allow_redirects=True,
+                timeout=30,
+            )
+
+            # Step 3: Load invoices page (needed to set server-side state)
+            session.get(f'{base_url}/invoices/invoice', timeout=30)
+
+            # Step 4: Get invoice grid JSON
+            resp = session.get(
+                f'{base_url}/invoices/invoicegrid',
+                params={
+                    'INVOICENUM': '',
+                    'SVCCODE': '',
+                    'UCI': '',
+                    'INVOICEDATE': '',
+                    'SVCMNYR': '',
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            invoice_data = resp.json()
+            invoice_items = invoice_data.get('items', [])
+            logger.info(f"  Invoice grid: {len(invoice_items)} rows for {spn_id}")
+
+            # Step 5: For each invoice, get consumer details
+            expanded_invoices = []
+            for inv_row in invoice_items:
+                row_id = inv_row.get('ID', '')
+                invoice_num = inv_row.get('BOINVN', '')
+                svc_code = inv_row.get('BOSVCD', '')
+                svc_month = inv_row.get('BOSVMY', '')
+
+                # Get consumer detail grid
+                resp = session.get(
+                    f'{base_url}/invoices/invoiceviewgrid/invoiceid/{row_id}/mode/A',
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                detail_data = resp.json()
+                detail_items = detail_data.get('items', [])
+
+                for consumer in detail_items:
+                    name = consumer.get('NAME', '')
+                    name_words = name.strip().split()
+                    expanded_invoices.append({
+                        'invoice_id': invoice_num,
+                        'last_name': ' '.join(name_words[:-1]) if len(name_words) > 1 else (name_words[0] if name_words else ''),
+                        'first_name': name_words[-1] if len(name_words) > 1 else '',
+                        'uci': consumer.get('BOCLID', ''),
+                        'service_month': svc_month,
+                        'svc_code': consumer.get('BOSVCD', svc_code),
+                        'svc_subcode': consumer.get('BOSVSC', ''),
+                        'auth_number': consumer.get('BOAUTH', ''),
+                        'provider_spn': spn_id,
+                        'provider_name': prov['name'],
+                    })
+
+                logger.info(f"    Invoice {invoice_num}: {len(detail_items)} consumers")
+
+            all_invoices.extend(expanded_invoices)
+            providers_scanned.append({'spn_id': spn_id, 'name': prov['name']})
+            logger.info(f"  Total for {spn_id}: {len(expanded_invoices)} invoices")
+
+    except req.RequestException as e:
+        logger.error(f"Fast scraper HTTP error: {e}")
+        return {
+            'status': 'error',
+            'error': 'http_error',
+            'message': f'HTTP request failed during fast scrape: {e}'
+        }
+    except (ValueError, KeyError) as e:
+        logger.error(f"Fast scraper parse error: {e}")
+        return {
+            'status': 'error',
+            'error': 'parse_error',
+            'message': f'Failed to parse portal response: {e}'
+        }
+
+    logger.info(f"Fast scraper complete: {len(all_invoices)} total invoices from {len(providers_scanned)} providers")
     result = {
         'status': 'success',
         'invoices': all_invoices,

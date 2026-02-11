@@ -15,16 +15,11 @@
             <div class="card-body">
                 <form method="POST" action="{{ url_for('auth.add_provider') }}">
                     <div class="row g-3">
-                        <div class="col-md-3">
+                        <div class="col-md-4">
                             <label class="form-label">Provider Name</label>
                             <input type="text" class="form-control" name="name" placeholder="MY SPEECH THERAPY INC" required>
                         </div>
-                        <div class="col-md-2">
-                            <label class="form-label">SPN ID</label>
-                            <input type="text" class="form-control" name="spn_id" placeholder="PP0212" required>
-                            <small class="text-muted">Service Provider #</small>
-                        </div>
-                        <div class="col-md-2">
+                        <div class="col-md-3">
                             <label class="form-label">Regional Center</label>
                             <select class="form-select" name="regional_center" required>
                                 <option value="">-- Select RC --</option>
@@ -61,7 +56,6 @@
                         <thead>
                             <tr>
                                 <th>Provider Name</th>
-                                <th>SPN ID</th>
                                 <th>Regional Center</th>
                                 <th>Username</th>
                                 <th>Password</th>
@@ -73,7 +67,6 @@
                             {% for p in providers %}
                             <tr>
                                 <td><strong>{{ p.name }}</strong></td>
-                                <td><code>{{ p.spn_id or '(not set)' }}</code></td>
                                 <td>
                                     <span class="badge bg-info">{{ p.regional_center }}</span>
                                     <br><small class="text-muted">{{ p.rc_name }}</small>
@@ -98,13 +91,10 @@
                                 </td>
                             </tr>
                             <tr class="collapse" id="edit{{ p.id }}">
-                                <td colspan="7" class="bg-light">
+                                <td colspan="6" class="bg-light">
                                     <form method="POST" action="{{ url_for('auth.update_provider', provider_id=p.id) }}" class="row g-2 p-2">
-                                        <div class="col-md-2">
+                                        <div class="col-md-3">
                                             <input type="text" class="form-control form-control-sm" name="name" value="{{ p.name }}" placeholder="Provider Name">
-                                        </div>
-                                        <div class="col-md-2">
-                                            <input type="text" class="form-control form-control-sm" name="spn_id" value="{{ p.spn_id or '' }}" placeholder="SPN ID (e.g. PP0212)" required>
                                         </div>
                                         <div class="col-md-2">
                                             <select class="form-select form-select-sm" name="regional_center">

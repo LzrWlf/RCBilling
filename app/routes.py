@@ -6,7 +6,7 @@ import csv
 import io
 from datetime import datetime
 from app.csv_parser import parse_rc_billing_csv, records_to_dict
-from app.automation.dds_ebilling import submit_to_ebilling, scrape_invoice_inventory, scrape_all_providers_inventory
+from app.automation.dds_ebilling import submit_to_ebilling, scrape_invoice_inventory, scrape_all_providers_inventory, scrape_all_providers_inventory_fast
 from app.models import db, Provider, SubmissionLog
 
 _last_submission_results = {}
@@ -422,7 +422,7 @@ def get_available_invoices_all():
         return redirect(url_for('main.index'))
 
     try:
-        result = scrape_all_providers_inventory(
+        result = scrape_all_providers_inventory_fast(
             username=username,
             password=password,
             regional_center=provider.regional_center,
@@ -475,9 +475,9 @@ def download_available_invoices():
     has_provider_spn = any(inv.get('provider_spn') for inv in user_results['invoices'])
 
     if has_provider_spn:
-        writer.writerow(['Provider SPN', 'Last Name', 'First Name', 'UCI', 'Service Month', 'Service Code', 'Invoice ID'])
+        writer.writerow(['Provider SPN', 'Last Name', 'First Name', 'UCI', 'Service Month', 'Service Code', 'SVC Subcode', 'Auth #', 'Invoice ID'])
     else:
-        writer.writerow(['Last Name', 'First Name', 'UCI', 'Service Month', 'Service Code', 'Invoice ID'])
+        writer.writerow(['Last Name', 'First Name', 'UCI', 'Service Month', 'Service Code', 'SVC Subcode', 'Auth #', 'Invoice ID'])
 
     for inv in user_results['invoices']:
         row = []
@@ -489,6 +489,8 @@ def download_available_invoices():
             inv.get('uci', ''),
             inv.get('service_month', ''),
             inv.get('svc_code', ''),
+            inv.get('svc_subcode', ''),
+            inv.get('auth_number', ''),
             inv.get('invoice_id', '')
         ])
         writer.writerow(row)
