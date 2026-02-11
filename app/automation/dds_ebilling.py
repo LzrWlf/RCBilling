@@ -1412,7 +1412,9 @@ class DDSeBillingBot:
                     'first_name': name_parts[1].strip() if len(name_parts) > 1 else '',
                     'uci': c.get('uci', ''),
                     'service_month': svc_month,
-                    'svc_code': c.get('svc_code', svc_code)
+                    'svc_code': c.get('svc_code', svc_code),
+                    'svc_subcode': c.get('svc_subcode', ''),
+                    'auth_number': c.get('auth_number', '')
                 })
 
             logger.info(f"  Found {len(invoices)} consumers in folder")
@@ -1439,55 +1441,182 @@ class DDSeBillingBot:
 
             logger.info(f"Caching multi-consumer invoice contents: invoice_id={invoice_id}, SVC={svc_code}, Month={svc_month_year}")
 
-            consumers = self.page.evaluate('''() => {
-                const results = [];
-                const rows = document.querySelectorAll('tr');
+            # Diagnostic: dump body text to check for missing consumer names
+            page_diag = self.page.evaluate('''() => {
+                const body = document.body.innerText || '';
+                // Check for iframes with content
+                const iframes = document.querySelectorAll('iframe');
+                let iframeInfo = [];
+                for (const iframe of iframes) {
+                    try {
+                        const doc = iframe.contentDocument;
+                        if (doc) {
+                            const trs = doc.querySelectorAll('tr');
+                            iframeInfo.push({src: iframe.src, trCount: trs.length, bodyLen: (doc.body?.innerText || '').length});
+                        }
+                    } catch(e) { iframeInfo.push({src: iframe.src, error: e.message}); }
+                }
+                // Get all text after "Filter All" to see consumer table content
+                const filterIdx = body.indexOf('Filter All');
+                const tableText = filterIdx >= 0 ? body.substring(filterIdx, filterIdx + 3000) : '';
+                return {
+                    iframes: iframeInfo,
+                    bodyLength: body.length,
+                    tableTextAfterFilter: tableText
+                };
+            }''')
+            logger.info(f"Invoice detail diag: bodyLen={page_diag.get('bodyLength')}, iframes={page_diag.get('iframes')}")
+            table_text = page_diag.get('tableTextAfterFilter', '')
+            if table_text and len(table_text) > 500:
+                logger.info(f"Table text (first 1500 chars): {table_text[:1500]}")
+                logger.info(f"Table text (last 500 chars): {table_text[-500:]}")
 
-                for (const row of rows) {
-                    const cells = row.querySelectorAll('td');
-                    if (cells.length < 6) continue;  // Skip header/insufficient rows
+            # Scrape all consumer lines with scroll loop to handle pages that
+            # lazy-render rows (e.g. Invoice 2610388 with 30 consumers only
+            # renders ~25 in the initial viewport).
+            all_consumers = {}  # keyed by line_number to deduplicate
+            all_skipped = []
+            max_scroll_iters = 20
 
-                    // Invoice view columns: [0]Checkbox, [1]Line#, [2]Consumer, [3]UCI#, [4]SVC Code, [5]SVC Subcode, [6]Auth#, ...
-                    // Find Line# column - it's a small integer (1, 2, 3...)
-                    let lineIdx = -1;
-                    for (let i = 0; i < Math.min(cells.length, 3); i++) {
-                        const text = cells[i]?.innerText?.trim() || '';
-                        if (/^\\d{1,3}$/.test(text) && parseInt(text) < 100) {
-                            lineIdx = i;
-                            break;
+            for scroll_iter in range(max_scroll_iters + 1):
+                consumers = self.page.evaluate('''() => {
+                    const results = [];
+                    const skipped = [];
+                    const rows = document.querySelectorAll('tr');
+
+                    for (const row of rows) {
+                        const cells = row.querySelectorAll('td');
+                        if (cells.length < 6) continue;
+
+                        // Find Line# column - it's a small integer (1, 2, 3...)
+                        let lineIdx = -1;
+                        for (let i = 0; i < Math.min(cells.length, 3); i++) {
+                            const text = cells[i]?.innerText?.trim() || '';
+                            if (/^\\d{1,3}$/.test(text) && parseInt(text) < 100) {
+                                lineIdx = i;
+                                break;
+                            }
+                        }
+
+                        if (lineIdx === -1) {
+                            // Log first 3 cells for rows with 6+ cells that don't match
+                            const preview = Array.from(cells).slice(0, 4).map(c => c.innerText?.trim()?.substring(0, 30) || '');
+                            if (preview.some(p => p.length > 0)) {
+                                skipped.push({reason: 'no_line_idx', cellCount: cells.length, preview: preview});
+                            }
+                            continue;
+                        }
+
+                        const lineNum = cells[lineIdx]?.innerText?.trim() || '';
+                        const consumerName = cells[lineIdx + 1]?.innerText?.trim() || '';
+                        const uci = cells[lineIdx + 2]?.innerText?.trim() || '';
+                        const svcCode = cells[lineIdx + 3]?.innerText?.trim() || '';
+                        const svcSubcode = cells[lineIdx + 4]?.innerText?.trim() || '';
+                        const authNumber = cells[lineIdx + 5]?.innerText?.trim() || '';
+
+                        if (lineNum && /^\\d+$/.test(lineNum) && /^\\d+$/.test(uci) && /[a-zA-Z]/.test(consumerName)) {
+                            results.push({
+                                line_number: parseInt(lineNum),
+                                consumer_name: consumerName,
+                                uci: uci,
+                                svc_code: svcCode,
+                                svc_subcode: svcSubcode,
+                                auth_number: authNumber
+                            });
+                        } else {
+                            skipped.push({reason: 'validation', lineNum, consumerName: consumerName.substring(0, 30), uci, cellCount: cells.length});
                         }
                     }
+                    return {results, skipped};
+                }''')
 
-                    if (lineIdx === -1) continue;
+                batch = consumers.get('results', [])
+                new_count = 0
+                for c in batch:
+                    if c['line_number'] not in all_consumers:
+                        all_consumers[c['line_number']] = c
+                        new_count += 1
+                if scroll_iter == 0:
+                    all_skipped = consumers.get('skipped', [])
 
-                    const lineNum = cells[lineIdx]?.innerText?.trim() || '';
-                    const consumerName = cells[lineIdx + 1]?.innerText?.trim() || '';
-                    const uci = cells[lineIdx + 2]?.innerText?.trim() || '';
-                    const svcCode = cells[lineIdx + 3]?.innerText?.trim() || '';
-                    const svcSubcode = cells[lineIdx + 4]?.innerText?.trim() || '';
-                    const authNumber = cells[lineIdx + 5]?.innerText?.trim() || '';
+                # First iteration: log what we found
+                if scroll_iter == 0:
+                    logger.info(f"Initial consumer scrape: {len(batch)} rows ({len(all_consumers)} unique)")
 
-                    // Validate: UCI should be a number, consumer name should have letters
-                    if (lineNum && /^\\d+$/.test(lineNum) && /^\\d+$/.test(uci) && /[a-zA-Z]/.test(consumerName)) {
-                        results.push({
-                            line_number: parseInt(lineNum),
-                            consumer_name: consumerName,
-                            uci: uci,
-                            svc_code: svcCode,
-                            svc_subcode: svcSubcode,
-                            auth_number: authNumber
-                        });
-                    }
-                }
-                return results;
-            }''')
+                # If this is scroll_iter 0 and we got rows, try scrolling to get more
+                if scroll_iter == 0 and len(batch) > 0:
+                    # Scroll the page down to trigger lazy-loaded rows
+                    scroll_result = self.page.evaluate('''() => {
+                        // First try scrolling any overflow container around the consumer table
+                        const tables = document.querySelectorAll('table');
+                        for (const table of tables) {
+                            let parent = table.parentElement;
+                            for (let i = 0; i < 5 && parent; i++) {
+                                if (parent.scrollHeight > parent.clientHeight + 10) {
+                                    const prevTop = parent.scrollTop;
+                                    parent.scrollTop = parent.scrollHeight;
+                                    if (parent.scrollTop !== prevTop) {
+                                        return {scrolled: true, method: 'container', tag: parent.tagName, prevTop: prevTop, newTop: parent.scrollTop, scrollHeight: parent.scrollHeight};
+                                    }
+                                }
+                                parent = parent.parentElement;
+                            }
+                        }
+                        // Fall back to scrolling the window
+                        const prevY = window.scrollY;
+                        window.scrollTo(0, document.body.scrollHeight);
+                        if (window.scrollY !== prevY) {
+                            return {scrolled: true, method: 'window', prevY: prevY, newY: window.scrollY};
+                        }
+                        return {scrolled: false};
+                    }''')
+                    logger.info(f"Consumer table scroll attempt: {scroll_result}")
+                    if not scroll_result.get('scrolled', False):
+                        break
+                    time.sleep(1.5)
+                    continue
 
-            self._multi_consumer_cache[invoice_key] = consumers
-            logger.info(f"Cached {len(consumers)} consumer lines for invoice {invoice_key}")
-            for c in consumers:
+                # On subsequent iterations, scroll incrementally
+                if scroll_iter > 0:
+                    if new_count > 0:
+                        logger.info(f"Scroll iter {scroll_iter}: +{new_count} new consumers ({len(all_consumers)} total)")
+                    scroll_result = self.page.evaluate('''() => {
+                        // Try all scrollable containers
+                        const containers = document.querySelectorAll('div, section, main');
+                        for (const el of containers) {
+                            if (el.scrollHeight > el.clientHeight + 10 && el.scrollTop < el.scrollHeight - el.clientHeight - 5) {
+                                const prevTop = el.scrollTop;
+                                el.scrollTop += el.clientHeight - 20;
+                                if (el.scrollTop !== prevTop) {
+                                    return {scrolled: true, atBottom: (el.scrollTop + el.clientHeight) >= (el.scrollHeight - 5)};
+                                }
+                            }
+                        }
+                        const prevY = window.scrollY;
+                        window.scrollTo(0, window.scrollY + window.innerHeight - 50);
+                        return {scrolled: window.scrollY !== prevY, atBottom: (window.scrollY + window.innerHeight) >= (document.body.scrollHeight - 5)};
+                    }''')
+                    if not scroll_result.get('scrolled', False) or scroll_result.get('atBottom', False):
+                        if new_count == 0:
+                            break
+                    time.sleep(1.0)
+                    if new_count == 0:
+                        break
+
+            consumers_list = sorted(all_consumers.values(), key=lambda c: c['line_number'])
+            if len(consumers_list) > len(all_consumers) - 5 and len(consumers_list) < len(all_consumers) + 5:
+                pass  # normal
+            if all_skipped:
+                logger.info(f"Skipped {len(all_skipped)} rows during scrape:")
+                for s in all_skipped[:10]:
+                    logger.info(f"  Skipped: {s}")
+
+            self._multi_consumer_cache[invoice_key] = consumers_list
+            logger.info(f"Cached {len(consumers_list)} consumer lines for invoice {invoice_key}")
+            for c in consumers_list:
                 logger.info(f"  Line {c['line_number']}: {c['consumer_name']} (UCI: {c['uci']})")
 
-            return consumers
+            return consumers_list
 
         except Exception as e:
             logger.error(f"Failed to cache multi-consumer invoice contents: {e}")
