@@ -47,6 +47,7 @@
                                 <th>Service Code</th>
                                 <th>SVC Subcode</th>
                                 <th>Auth #</th>
+                                <th>Auth Units</th>
                                 <th>Invoice ID</th>
                             </tr>
                         </thead>
@@ -61,6 +62,7 @@
                                 <td>{{ inv.svc_code }}</td>
                                 <td>{{ inv.svc_subcode }}</td>
                                 <td><small>{{ inv.auth_number }}</small></td>
+                                <td>{{ inv.auth_units }}</td>
                                 <td><small class="text-muted">{{ inv.invoice_id }}</small></td>
                             </tr>
                             {% endfor %}

@@ -2977,6 +2977,7 @@ def scrape_all_providers_inventory_fast(username: str, password: str,
                         'svc_code': consumer.get('BOSVCD', svc_code),
                         'svc_subcode': consumer.get('BOSVSC', ''),
                         'auth_number': consumer.get('BOAUTH', ''),
+                        'auth_units': consumer.get('BIUNTE', ''),
                         'provider_spn': spn_id,
                         'provider_name': prov['name'],
                     })
@@ -3011,3 +3012,510 @@ def scrape_all_providers_inventory_fast(username: str, password: str,
     if password_expiry_days is not None:
         result['warnings'] = [f'Your eBilling portal password will expire in {password_expiry_days} days. Please change it soon.']
     return result
+
+
+def _normalize_month(month_str: str) -> str:
+    """Normalize month format: '8/2025' -> '08/2025'"""
+    if not month_str:
+        return ''
+    parts = month_str.split('/')
+    if len(parts) == 2:
+        return parts[0].zfill(2) + '/' + parts[1]
+    return month_str
+
+
+def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
+                            provider_name: str = None,
+                            regional_center: str = "ELARC",
+                            portal_url: str = None) -> List[SubmissionResult]:
+    """
+    Fast billing submission using direct HTTP requests.
+
+    Uses Playwright ONLY for login (popup window), then switches to
+    requests.Session() for all navigation and calendar form submission.
+    Much faster than the fully Playwright-based submit_to_ebilling().
+
+    Args:
+        records: List of billing record dicts (from CSV parser)
+        username: Portal login username
+        password: Portal login password
+        provider_name: SPN ID for provider selection (if None, uses spn_id from first record)
+        regional_center: Regional center code
+        portal_url: Portal URL override
+
+    Returns:
+        List of SubmissionResult objects
+    """
+    import requests as req
+    import re
+
+    results = []
+
+    # Get provider SPN from first record if not specified
+    if not provider_name and records:
+        provider_name = records[0].get('spn_id', '')
+    if not provider_name:
+        return [SubmissionResult(success=False, error_message="No provider specified")]
+
+    # --- Phase 1: Login via Playwright to get session cookie ---
+    bot = DDSeBillingBot(username, password, headless=None,
+                         regional_center=regional_center, portal_url=portal_url)
+    bot.start()
+    try:
+        if not bot.login():
+            bot.stop()
+            return [SubmissionResult(success=False, error_message="Login failed")]
+
+        cookies = bot.context.cookies()
+        session_cookie = None
+        for c in cookies:
+            if c['name'] == 'PHPSESSID':
+                session_cookie = c['value']
+                break
+
+        if not session_cookie:
+            bot.stop()
+            return [SubmissionResult(success=False, error_message="Could not extract session cookie")]
+
+        base_url = bot.portal_url.rsplit('/login', 1)[0]
+        logger.info(f"Fast submit: base_url={base_url}, PHPSESSID={session_cookie[:8]}...")
+    finally:
+        if bot.browser:
+            bot.browser.close()
+        if bot.playwright:
+            bot.playwright.stop()
+        logger.info("Browser closed (no logout — session preserved)")
+
+    # --- Phase 2: HTTP session setup ---
+    session = req.Session()
+    session.cookies.set('PHPSESSID', session_cookie, domain='ebilling.dds.ca.gov')
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+    })
+    session.verify = False
+
+    try:
+        # --- Phase 3: Select provider ---
+        logger.info(f"Selecting provider: {provider_name}")
+        resp = session.get(f'{base_url}/home/dashboardspngrid', timeout=30)
+        resp.raise_for_status()
+        providers_data = resp.json()
+        providers_items = providers_data.get('items', [])
+
+        # Find the provider by SPN code
+        target_provider = None
+        for p in providers_items:
+            if p.get('SPNCD', '') == provider_name:
+                target_provider = p
+                break
+
+        # Fallback: match by numeric portion
+        if not target_provider:
+            numeric_part = ''.join(c for c in provider_name if c.isdigit())
+            for p in providers_items:
+                if numeric_part and numeric_part in p.get('SPNCD', ''):
+                    target_provider = p
+                    break
+
+        if not target_provider:
+            return [SubmissionResult(success=False, error_message=f"Provider {provider_name} not found on portal")]
+
+        # Select provider
+        session.post(f'{base_url}/home/setspn', data={
+            'SPNSelID': target_provider['SPNID'],
+            'SPNSelCD': '', 'SPNSelDesc': '', 'downloadid': ''
+        }, allow_redirects=True, timeout=30)
+        logger.info(f"Selected provider: {target_provider.get('SPNCD')} ({target_provider.get('DESC')})")
+
+        # --- Phase 4: Build invoice inventory ---
+        logger.info("=" * 60)
+        logger.info("=== PHASE 1: Building Invoice Inventory (HTTP) ===")
+        logger.info("=" * 60)
+
+        session.get(f'{base_url}/invoices/invoice', timeout=30)
+        resp = session.get(f'{base_url}/invoices/invoicegrid', params={
+            'INVOICENUM': '', 'SVCCODE': '', 'UCI': '',
+            'INVOICEDATE': '', 'SVCMNYR': ''
+        }, timeout=30)
+        resp.raise_for_status()
+        invoice_data = resp.json()
+        invoice_items = invoice_data.get('items', [])
+        logger.info(f"Found {len(invoice_items)} invoices on portal")
+
+        # Build inventory with consumer details
+        inventory = []
+        invoice_lookup = {}  # (svc_code, normalized_month, uci) -> invoice_internal_id
+
+        for inv_row in invoice_items:
+            row_id = inv_row.get('ID', '')
+            invoice_num = inv_row.get('BOINVN', '')
+            svc_code = inv_row.get('BOSVCD', '')
+            svc_month = inv_row.get('BOSVMY', '')
+            uci = inv_row.get('BOCLID', '')
+            has_uci = bool(uci and uci.strip())
+
+            # Get consumer details for this invoice
+            resp = session.get(
+                f'{base_url}/invoices/invoiceviewgrid/invoiceid/{row_id}/mode/A',
+                timeout=30
+            )
+            resp.raise_for_status()
+            detail_data = resp.json()
+            detail_items = detail_data.get('items', [])
+
+            for consumer in detail_items:
+                consumer_uci = consumer.get('BOCLID', '')
+                consumer_line_id = consumer.get('ID', '')
+                norm_month = _normalize_month(svc_month)
+
+                inventory.append({
+                    'invoice_id': invoice_num,
+                    'invoice_internal_id': row_id,
+                    'consumer_line_id': consumer_line_id,
+                    'svc_code': consumer.get('BOSVCD', svc_code),
+                    'svc_subcode': consumer.get('BOSVSC', ''),
+                    'svc_month': svc_month,
+                    'uci': consumer_uci,
+                    'has_uci': has_uci,
+                    'name': consumer.get('NAME', ''),
+                    'auth_number': consumer.get('BOAUTH', ''),
+                    'auth_units': consumer.get('BIUNTE', ''),
+                    'cal_type': consumer.get('CALTYPE', 'U'),
+                })
+
+                # Build lookup: (uci, normalized_month) -> inventory item
+                if consumer_uci:
+                    invoice_lookup[(consumer_uci, norm_month)] = inventory[-1]
+
+            logger.info(f"  Invoice {invoice_num} (SVC={svc_code}, {svc_month}): {len(detail_items)} consumers")
+
+        logger.info(f"Inventory complete: {len(inventory)} consumer lines across {len(invoice_items)} invoices")
+
+        # --- Phase 5: Match records to inventory ---
+        logger.info("=" * 60)
+        logger.info("=== PHASE 2: Matching Records to Inventory ===")
+        logger.info("=" * 60)
+
+        # Build lookup structures
+        inventory_by_key = defaultdict(list)
+        for inv in inventory:
+            key = (inv['svc_code'], _normalize_month(inv['svc_month']))
+            inventory_by_key[key].append(inv)
+
+        inventory_by_uci = {}
+        for inv in inventory:
+            uci = inv.get('uci', '')
+            if uci:
+                month = _normalize_month(inv['svc_month'])
+                inventory_by_uci[(uci, month)] = inv
+
+        matchable_records = []
+        unmatched_records = []
+
+        for record in records:
+            svc_code = record.get('svc_code', '')
+            service_month = _normalize_month(record.get('service_month', ''))
+            uci = record.get('uci', '')
+            consumer_name = record.get('consumer_name', '')
+
+            # Method 1: Direct UCI + month match
+            matched_inv = inventory_by_uci.get((uci, service_month))
+            if matched_inv:
+                record['_matched_inv'] = matched_inv
+                matchable_records.append(record)
+                logger.debug(f"  Match: {consumer_name} (UCI: {uci})")
+                continue
+
+            # Method 2: Check by service code + month
+            key = (svc_code, service_month)
+            matching_invoices = inventory_by_key.get(key, [])
+
+            if not matching_invoices:
+                record['skip_reason'] = f"No invoice found for SVC {svc_code}, Month {service_month}"
+                unmatched_records.append(record)
+                continue
+
+            # Look for matching UCI within the invoice group
+            found = False
+            for inv in matching_invoices:
+                if inv.get('uci') == uci:
+                    record['_matched_inv'] = inv
+                    matchable_records.append(record)
+                    found = True
+                    break
+
+            if not found:
+                record['skip_reason'] = f"UCI {uci} not found in invoices for SVC {svc_code}, Month {service_month}"
+                unmatched_records.append(record)
+
+        logger.info(f"Match results: {len(matchable_records)} matchable, {len(unmatched_records)} skipped")
+
+        # Create skip results for unmatched records
+        for record in unmatched_records:
+            results.append(SubmissionResult(
+                success=False,
+                consumer_name=record.get('consumer_name', ''),
+                uci=record.get('uci', ''),
+                error_message=f"SKIPPED: {record.get('skip_reason', 'No matching invoice')}",
+                invoice_units=float(record.get('entered_units', 0) or 0),
+                invoice_amount=float(record.get('entered_amount', 0) or 0)
+            ))
+
+        if not matchable_records:
+            logger.warning("No records matched — nothing to process")
+            return results
+
+        # --- Phase 6: Submit each matched record ---
+        logger.info("=" * 60)
+        logger.info(f"=== PHASE 3: Submitting {len(matchable_records)} Records (HTTP) ===")
+        logger.info("=" * 60)
+
+        for record in matchable_records:
+            uci = record.get('uci', '')
+            consumer_name = record.get('consumer_name', '')
+            service_days = record.get('service_days', [])
+            invoice_units = float(record.get('entered_units', 0) or 0)
+            invoice_amount = float(record.get('entered_amount', 0) or 0)
+            matched_inv = record.get('_matched_inv', {})
+            invoice_internal_id = matched_inv.get('invoice_internal_id', '')
+            consumer_line_id = matched_inv.get('consumer_line_id', '')
+
+            logger.info(f"Processing: {consumer_name} (UCI: {uci}, line_id: {consumer_line_id})")
+
+            try:
+                # Step 1: Open invoice for editing
+                resp = session.post(f'{base_url}/invoices/invoiceview', data={
+                    'invoiceid': invoice_internal_id,
+                    'updatemode': 'Y',
+                    'selectallrecords': '',
+                    'invoiceno': '',
+                    'TARGET': ''
+                }, allow_redirects=True, timeout=30)
+
+                # Save invoiceview HTML for debugging
+                invoiceview_html = resp.text
+                with open('debug_invoiceview.html', 'w') as f:
+                    f.write(invoiceview_html)
+                logger.info(f"  Saved invoiceview HTML ({len(invoiceview_html)} bytes) to debug_invoiceview.html")
+
+                # Step 2: Navigate to calendar for this consumer line
+                # The invoiceview page uses a JS form POST (viewInvoicedetail)
+                # to navigate to unitcalendar. We replicate that POST here.
+                resp = session.post(f'{base_url}/invoices/unitcalendar', data={
+                    'invoicedetid': consumer_line_id,
+                    'updatemode': 'Y',
+                    'invoiceid': invoice_internal_id,
+                }, allow_redirects=True, timeout=30)
+                calendar_html = resp.text
+
+                # Save calendar HTML for debugging
+                with open('debug_calendar.html', 'w') as f:
+                    f.write(calendar_html)
+                logger.info(f"  Calendar page: {len(calendar_html)} bytes, status: {resp.status_code}")
+
+                # Step 3: Parse calendar form
+                # The calendar form (unitcalendarForm) uses Dojo widgets.
+                # Day inputs are named C1-C31, with hidden W1-W31 and ABSENCETYPES1-31.
+                # We need to include ALL inputs in the POST, not just changed ones.
+                form_data = {}
+
+                # Extract ALL input fields (hidden + text) generically
+                for input_match in re.finditer(r'<input\s+([^>]*)/?>', calendar_html, re.IGNORECASE):
+                    attrs_str = input_match.group(1)
+                    name_m = re.search(r'name=["\']([^"\']*)["\']', attrs_str)
+                    value_m = re.search(r'value=["\']([^"\']*)["\']', attrs_str)
+                    # Also handle unquoted value like value=3
+                    if not value_m:
+                        value_m = re.search(r'value=(\S+)', attrs_str)
+                    if name_m:
+                        name = name_m.group(1)
+                        value = value_m.group(1) if value_m else ''
+                        form_data[name] = value
+
+                logger.info(f"  Extracted {len(form_data)} form fields from calendar HTML")
+
+                # Parse day inputs specifically: C1-C31
+                day_values = {}  # day_num -> existing value
+                days_already_entered = []
+                max_day = 0
+
+                for day_num in range(1, 32):
+                    key = f'C{day_num}'
+                    if key in form_data:
+                        max_day = day_num
+                        val_str = form_data[key].strip()
+                        try:
+                            val = float(val_str) if val_str else 0.0
+                        except ValueError:
+                            val = 0.0
+                        day_values[day_num] = val
+                        if val > 0:
+                            days_already_entered.append(day_num)
+
+                # Determine which days are outside the auth period
+                # Check authorization dates from the HTML
+                auth_start_day = 1
+                auth_end_day = max_day
+                auth_match = re.search(
+                    r'Authorization_dates.*?(\d{2})/(\d{2})/(\d{2})\s*-\s*(\d{2})/(\d{2})/(\d{2})',
+                    calendar_html, re.IGNORECASE
+                )
+                if not auth_match:
+                    auth_match = re.search(
+                        r'AUTHORIZATION_DATES.*?(\d{2})/(\d{2})/(\d{2})\s*-\s*(\d{2})/(\d{2})/(\d{2})',
+                        calendar_html, re.IGNORECASE
+                    )
+
+                logger.info(f"  Calendar has {max_day} days, {len(days_already_entered)} with existing values: {days_already_entered}")
+
+                # Step 4: Fill in service days
+                days_entered = 0
+                unavailable_days = []
+                already_entered_days = list(days_already_entered)
+
+                for day in service_days:
+                    key = f'C{day}'
+                    if key not in form_data:
+                        unavailable_days.append(day)
+                        continue
+                    if day in days_already_entered:
+                        # Already has a value, skip
+                        continue
+                    form_data[key] = '1'  # 1 unit
+                    days_entered += 1
+
+                # Set the computed hidden fields like SubmitForm() does in JS
+                # Calculate total units
+                total_units = 0.0
+                for day_num in range(1, max_day + 1):
+                    key = f'C{day_num}'
+                    if key in form_data:
+                        try:
+                            total_units += float(form_data[key]) if form_data[key] else 0.0
+                        except ValueError:
+                            pass
+
+                # Get unit rate from page (JS var monthlyrate = 143.130;)
+                rate_match = re.search(r'monthlyrate\s*=\s*([0-9.]+)', calendar_html)
+                if not rate_match:
+                    rate_match = re.search(r'unitrate\s*=\s*([0-9.]+)', calendar_html, re.IGNORECASE)
+                unit_rate = float(rate_match.group(1)) if rate_match else 0.0
+
+                gross_amount = round(total_units * unit_rate, 2) if unit_rate else 0.0
+
+                net_amount = gross_amount  # net = gross - received revenue (usually 0)
+
+                form_data['invoicedetid'] = consumer_line_id
+                form_data['invoiceid'] = invoice_internal_id
+                form_data['updatemode'] = 'Y'
+                form_data['UNITSUM'] = str(total_units)
+                form_data['AMTSUM'] = str(net_amount)
+                form_data['TOTALUNITS'] = str(total_units)
+                form_data['GROSSAMT'] = str(gross_amount)
+                form_data['NETAMT'] = str(net_amount)
+                form_data['previousnext'] = ''
+
+                # Extract linenumber and authorizationnum from JS
+                line_match = re.search(r'linenumber\.value\s*=\s*[\'"](\d+)[\'"]', calendar_html)
+                if line_match:
+                    form_data['linenumber'] = line_match.group(1)
+                auth_match = re.search(r'authorizationnum\.value\s*=\s*[\'"](\d+)[\'"]', calendar_html)
+                if auth_match:
+                    form_data['authorizationnum'] = auth_match.group(1)
+
+                # Remove fields that shouldn't be submitted (display-only with script tags)
+                for key in list(form_data.keys()):
+                    if '<script>' in str(form_data[key]) or '<' in str(form_data[key]):
+                        form_data[key] = ''
+
+                logger.info(f"  Day inputs: {max_day} days, already entered: {days_already_entered}")
+                logger.info(f"  Total units: {total_units}, rate: {unit_rate}, gross: {gross_amount}")
+
+                # The SubmitForm() JS sets action to /invoices/unitcalendarupdate
+                form_action = f'{base_url}/invoices/unitcalendarupdate'
+
+                # Step 5: Submit the calendar form
+                logger.info(f"  Submitting {days_entered} days to {form_action}")
+                resp = session.post(form_action, data=form_data, allow_redirects=True, timeout=30)
+                response_html = resp.text
+
+                # Save response HTML for debugging
+                with open('debug_calendar_response.html', 'w') as f:
+                    f.write(response_html)
+                logger.info(f"  Response: {resp.status_code}, {len(response_html)} bytes")
+
+                # Step 6: Parse billing summary from response
+                # TOTALUNITS is in the HTML; GROSSAMT and NETAMT are JS-computed
+                rc_units = 0.0
+                rc_gross = 0.0
+                rc_net = 0.0
+                rc_rate = unit_rate
+
+                # Get totalunits from response (JS var or HTML field)
+                resp_total = re.search(r'var totalunits = ([0-9.]+)', response_html)
+                if resp_total:
+                    rc_units = float(resp_total.group(1))
+                else:
+                    rc_units = total_units
+
+                # Gross and net are JS-computed, use our calculation
+                resp_rate = re.search(r'var monthlyrate = ([0-9.]+)', response_html)
+                if resp_rate:
+                    rc_rate = float(resp_rate.group(1))
+                rc_gross = round(rc_units * rc_rate, 2)
+                rc_net = rc_gross  # net = gross - received revenue (usually 0)
+
+                # Determine success
+                # Only count already-entered days that overlap with requested service_days
+                relevant_already = [d for d in already_entered_days if d in service_days]
+                days_expected = len(service_days)
+                effective_days = days_entered + len(relevant_already)
+                is_partial = effective_days > 0 and effective_days < days_expected
+                is_success = effective_days == days_expected and days_expected > 0
+
+                if is_partial:
+                    error_msg = f"PARTIAL: Only {effective_days}/{days_expected} days covered. Unavailable: {unavailable_days}"
+                    logger.warning(f"  Partial: {consumer_name} ({effective_days}/{days_expected} days)")
+                elif effective_days == 0:
+                    error_msg = f"FAILED: No days could be entered - all {days_expected} days unavailable"
+                    logger.error(f"  Failed: {consumer_name} - all days unavailable")
+                else:
+                    error_msg = None
+                    logger.info(f"  Submitted: {consumer_name} ({days_entered} days entered, {len(already_entered_days)} already done)")
+
+                results.append(SubmissionResult(
+                    success=is_success,
+                    partial=is_partial,
+                    consumer_name=consumer_name,
+                    uci=uci,
+                    days_entered=days_entered,
+                    days_expected=days_expected,
+                    unavailable_days=unavailable_days,
+                    already_entered_days=already_entered_days,
+                    error_message=error_msg,
+                    rc_units_billed=rc_units,
+                    rc_gross_amount=rc_gross,
+                    rc_net_amount=rc_net,
+                    rc_unit_rate=rc_rate,
+                    invoice_units=invoice_units,
+                    invoice_amount=invoice_amount
+                ))
+
+            except Exception as e:
+                logger.error(f"  Error submitting {consumer_name}: {e}")
+                results.append(SubmissionResult(
+                    success=False,
+                    consumer_name=consumer_name,
+                    uci=uci,
+                    days_expected=len(service_days),
+                    error_message=str(e),
+                    invoice_units=invoice_units,
+                    invoice_amount=invoice_amount
+                ))
+
+    except req.RequestException as e:
+        logger.error(f"Fast submit HTTP error: {e}")
+        return [SubmissionResult(success=False, error_message=f"HTTP error: {e}")]
+
+    logger.info(f"Fast submit complete: {len(results)} results")
+    return results
