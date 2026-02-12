@@ -32,7 +32,7 @@ while [ $ITERATION -lt $MAX_ITERATIONS ]; do
     echo "--- Iteration $ITERATION / $MAX_ITERATIONS --- ($(date))"
 
     # Run Claude Code with the prompt (--print mode = non-interactive)
-    cat "$PROJECT_DIR/PROMPT.md" | claude --print 2>&1 || true
+    cat "$PROJECT_DIR/PROMPT.md" | claude --print --allowedTools 'Bash(*)' 'Read(*)' 'Write(*)' 'Edit(*)' 'Glob(*)' 'Grep(*)' 2>&1 || true
 
     echo ""
 
