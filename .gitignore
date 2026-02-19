@@ -42,3 +42,8 @@ Thumbs.db
 # Logs
 *.log
 .data/
+
+# Debug/test artifacts
+debug_*.html
+captured_cookies.json
+network_log.json
