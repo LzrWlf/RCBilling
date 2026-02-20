@@ -474,6 +474,45 @@ async function submitClaims() {
         status.classList.remove('alert-info');
         status.classList.add('alert-success');
 
+        // Build Invoice Summary table
+        let invoiceSummaryHtml = '';
+        if (result.invoice_summary && result.invoice_summary.length > 0) {
+            const hasZeroDayInvoices = result.invoice_summary.some(s => s.sub_invoices_zero_days > 0);
+            const alertClass = hasZeroDayInvoices ? 'border-warning' : 'border-success';
+            invoiceSummaryHtml = `
+                <div class="card mt-3 ${alertClass}" style="border-width: 2px;">
+                    <div class="card-header bg-dark text-white d-flex justify-content-between align-items-center">
+                        <h6 class="mb-0">Invoice Summary</h6>
+                        ${hasZeroDayInvoices ? '<span class="badge bg-warning text-dark">Some invoices have sub-invoices with 0 days</span>' : '<span class="badge bg-success">All sub-invoices have days attended</span>'}
+                    </div>
+                    <div class="card-body p-0">
+                        <table class="table table-sm mb-0">
+                            <thead class="table-secondary">
+                                <tr>
+                                    <th>Invoice #</th>
+                                    <th class="text-center">Sub Invoices</th>
+                                    <th class="text-center">0 Days Attended</th>
+                                </tr>
+                            </thead>
+                            <tbody>`;
+
+            result.invoice_summary.forEach(s => {
+                const zeroClass = s.sub_invoices_zero_days > 0 ? 'table-warning' : '';
+                const zeroBadge = s.sub_invoices_zero_days > 0
+                    ? `<span class="badge bg-danger">${s.sub_invoices_zero_days}</span>`
+                    : `<span class="badge bg-success">0</span>`;
+                invoiceSummaryHtml += `
+                    <tr class="${zeroClass}">
+                        <td><strong>${s.invoice_id || '(No Invoice #)'}</strong></td>
+                        <td class="text-center">${s.total_sub_invoices}</td>
+                        <td class="text-center">${zeroBadge}</td>
+                    </tr>`;
+            });
+
+            invoiceSummaryHtml += '</tbody></table></div></div>';
+        }
+
+        // Build detail results table
         let detailsHtml = '';
         if (result.results && result.results.length > 0) {
             // Group results by invoice number
@@ -508,18 +547,33 @@ async function submitClaims() {
                         </thead>
                         <tbody>`;
 
+            // Build portal totals lookup from invoice_summary
+            const portalTotals = {};
+            if (result.invoice_summary) {
+                result.invoice_summary.forEach(s => {
+                    const key = s.invoice_id || 'NO_INVOICE';
+                    portalTotals[key] = s.total_sub_invoices;
+                });
+            }
+
             sortedInvoices.forEach(invId => {
                 const records = grouped[invId];
-                const consumersWithZeroDays = records.filter(r => r.days_entered === 0 || !r.days_entered).length;
+                const submittedSubs = records.length;
+                const subsWithDays = records.filter(r => r.days_entered > 0 || (r.already_entered_days && r.already_entered_days.length > 0)).length;
+                const portalTotal = portalTotals[invId] || submittedSubs;
+                const subsZeroDays = portalTotal - subsWithDays;
                 const displayInv = invId === 'NO_INVOICE' ? '(No Invoice #)' : invId;
 
-                // Invoice summary row
+                // Invoice summary row with sub-invoice breakdown
+                const zeroDaysBadge = subsZeroDays > 0
+                    ? `<span class="badge bg-danger">${subsZeroDays} with 0 days</span>`
+                    : `<span class="badge bg-success">0 with 0 days</span>`;
                 detailsHtml += `
                     <tr class="table-info">
                         <td colspan="8" class="fw-bold">
                             <span class="badge bg-primary me-2">Invoice #${displayInv}</span>
-                            ${records.length} total |
-                            <span class="${consumersWithZeroDays > 0 ? 'text-danger' : ''}">${consumersWithZeroDays} with 0 days</span>
+                            <span class="badge bg-dark">${portalTotal} sub-invoices</span>
+                            ${zeroDaysBadge}
                         </td>
                     </tr>`;
 
@@ -563,6 +617,7 @@ async function submitClaims() {
         status.innerHTML = `
             <strong>Complete!</strong> ${result.message}
             <br>Success: ${result.success_count} | Failed: ${result.failed_count}
+            ${invoiceSummaryHtml}
             ${detailsHtml}
             <div class="mt-3">
                 <a href="{{ url_for('main.download_report') }}" class="btn btn-primary">

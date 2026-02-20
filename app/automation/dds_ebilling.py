@@ -3064,9 +3064,10 @@ def _normalize_month(month_str: str) -> str:
 def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
                             provider_name: str = None,
                             regional_center: str = "ELARC",
-                            portal_url: str = None) -> List[SubmissionResult]:
+                            portal_url: str = None) -> tuple:
     """
     Fast billing submission using direct HTTP requests.
+    Returns (List[SubmissionResult], dict) where dict maps invoice_id -> total portal sub-invoices.
 
     Uses Playwright ONLY for login (popup window), then switches to
     requests.Session() for all navigation and calendar form submission.
@@ -3092,7 +3093,7 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
     if not provider_name and records:
         provider_name = records[0].get('spn_id', '')
     if not provider_name:
-        return [SubmissionResult(success=False, error_message="No provider specified")]
+        return [SubmissionResult(success=False, error_message="No provider specified")], {}
 
     # --- Phase 1: Login via Playwright to get session cookie ---
     bot = DDSeBillingBot(username, password, headless=None,
@@ -3101,7 +3102,7 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
     try:
         if not bot.login():
             bot.stop()
-            return [SubmissionResult(success=False, error_message="Login failed")]
+            return [SubmissionResult(success=False, error_message="Login failed")], {}
 
         cookies = bot.context.cookies()
         session_cookie = None
@@ -3112,7 +3113,7 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
 
         if not session_cookie:
             bot.stop()
-            return [SubmissionResult(success=False, error_message="Could not extract session cookie")]
+            return [SubmissionResult(success=False, error_message="Could not extract session cookie")], {}
 
         base_url = bot.portal_url.rsplit('/login', 1)[0]
         logger.info(f"Fast submit: base_url={base_url}, PHPSESSID={session_cookie[:8]}...")
@@ -3155,7 +3156,7 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
                     break
 
         if not target_provider:
-            return [SubmissionResult(success=False, error_message=f"Provider {provider_name} not found on portal")]
+            return [SubmissionResult(success=False, error_message=f"Provider {provider_name} not found on portal")], {}
 
         # Select provider
         session.post(f'{base_url}/home/setspn', data={
@@ -3182,6 +3183,7 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
         # Build inventory with consumer details
         inventory = []
         invoice_lookup = {}  # (svc_code, normalized_month, uci) -> invoice_internal_id
+        portal_invoice_totals = {}  # invoice_num -> total consumer lines on portal
 
         for inv_row in invoice_items:
             row_id = inv_row.get('ID', '')
@@ -3224,6 +3226,7 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
                 if consumer_uci:
                     invoice_lookup[(consumer_uci, norm_month)] = inventory[-1]
 
+            portal_invoice_totals[invoice_num] = len(detail_items)
             logger.info(f"  Invoice {invoice_num} (SVC={svc_code}, {svc_month}): {len(detail_items)} consumers")
 
         logger.info(f"Inventory complete: {len(inventory)} consumer lines across {len(invoice_items)} invoices")
@@ -3300,7 +3303,7 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
 
         if not matchable_records:
             logger.warning("No records matched — nothing to process")
-            return results
+            return results, portal_invoice_totals
 
         # --- Phase 6: Submit each matched record ---
         logger.info("=" * 60)
@@ -3555,10 +3558,10 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
 
     except req.RequestException as e:
         logger.error(f"Fast submit HTTP error: {e}")
-        return [SubmissionResult(success=False, error_message=f"HTTP error: {e}")]
+        return [SubmissionResult(success=False, error_message=f"HTTP error: {e}")], {}
 
     logger.info(f"Fast submit complete: {len(results)} results")
-    return results
+    return results, portal_invoice_totals
 
 
 # =============================================================================

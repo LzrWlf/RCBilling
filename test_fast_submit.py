@@ -81,7 +81,7 @@ def main():
 
     print("\n[TEST] Running submit_to_ebilling_fast()...")
     start = time.time()
-    results = submit_to_ebilling_fast(
+    results, portal_invoice_totals = submit_to_ebilling_fast(
         records=[test_record],
         username=creds['username'],
         password=creds['password'],
@@ -94,6 +94,8 @@ def main():
     print("\n" + "=" * 60)
     print(f"TIME: {elapsed:.1f} seconds")
     print(f"RESULTS: {len(results)} record(s)")
+    if portal_invoice_totals:
+        print(f"PORTAL INVOICE TOTALS: {portal_invoice_totals}")
 
     for i, r in enumerate(results):
         print(f"\n--- Result {i+1} ---")

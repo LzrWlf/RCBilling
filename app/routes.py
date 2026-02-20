@@ -95,7 +95,7 @@ def submit_claims():
     try:
         # Use spn_id from CSV records for provider selection (not provider.name)
         # This allows matching by SPN ID in the portal's provider table
-        results = submit_to_ebilling_fast(
+        results, portal_invoice_totals = submit_to_ebilling_fast(
             records=records,
             username=username,
             password=password,
@@ -145,6 +145,47 @@ def submit_claims():
                 'rc_unit_rate': r.rc_unit_rate
             })
 
+        # Build invoice-level summary (sub-invoice stats per invoice)
+        # portal_invoice_totals has the TOTAL consumer lines per invoice from the portal
+        from collections import defaultdict as _defaultdict
+        _inv_groups = _defaultdict(list)
+        for r in result_details:
+            inv_id = r.get('invoice_id', '') or 'NO_INVOICE'
+            _inv_groups[inv_id].append(r)
+
+        def _inv_sort_key(inv_id):
+            try:
+                return (0, int(inv_id))
+            except (ValueError, TypeError):
+                return (1, str(inv_id))
+
+        # Track which invoice IDs we've already summarised
+        _seen_inv_ids = set()
+
+        invoice_summary = []
+        for inv_id in sorted(_inv_groups.keys(), key=_inv_sort_key):
+            records_in_inv = _inv_groups[inv_id]
+            with_days = sum(1 for r in records_in_inv if (r.get('days_entered') or 0) > 0 or r.get('already_entered_days'))
+            # Use portal total if available, otherwise fall back to submitted count
+            portal_total = portal_invoice_totals.get(inv_id, len(records_in_inv)) if inv_id != 'NO_INVOICE' else len(records_in_inv)
+            zero_days = portal_total - with_days
+            invoice_summary.append({
+                'invoice_id': inv_id if inv_id != 'NO_INVOICE' else '',
+                'total_sub_invoices': portal_total,
+                'sub_invoices_zero_days': zero_days
+            })
+            _seen_inv_ids.add(inv_id)
+
+        # Add portal invoices that had NO submitted records
+        for inv_id in sorted(portal_invoice_totals.keys(), key=_inv_sort_key):
+            if inv_id not in _seen_inv_ids:
+                portal_total = portal_invoice_totals[inv_id]
+                invoice_summary.append({
+                    'invoice_id': inv_id,
+                    'total_sub_invoices': portal_total,
+                    'sub_invoices_zero_days': portal_total  # all zero-day since nothing submitted
+                })
+
         _last_submission_results[current_user.id] = {
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'provider_name': provider.name,
@@ -153,7 +194,8 @@ def submit_claims():
             'partial_count': partial_count,
             'skipped_count': skipped_count,
             'failed_count': failed_count,
-            'results': result_details
+            'results': result_details,
+            'invoice_summary': invoice_summary
         }
 
         # Log submission (only count actual attempts, not skipped)
@@ -192,6 +234,7 @@ def submit_claims():
             'skipped_count': skipped_count,
             'failed_count': failed_count,
             'results': result_details,
+            'invoice_summary': invoice_summary,
             'has_errors': failed_count > 0 or partial_count > 0
         })
 
@@ -243,16 +286,21 @@ def download_report():
         # Sort records within invoice by consumer name
         records_sorted = sorted(records, key=lambda x: x.get('consumer_name', ''))
 
-        # Count consumers with 0 days entered
-        consumers_with_zero_days = sum(1 for r in records if r.get('days_entered', 0) == 0)
+        # Count sub-invoice stats
+        submitted_subs = len(records)
+        subs_with_days = sum(1 for r in records if (r.get('days_entered') or 0) > 0 or r.get('already_entered_days'))
+        # Find portal total from invoice_summary data
+        inv_sum_entry = next((s for s in user_results.get('invoice_summary', [])
+                              if s.get('invoice_id', '') == (invoice_id if invoice_id != 'NO_INVOICE' else '')), None)
+        total_subs = inv_sum_entry['total_sub_invoices'] if inv_sum_entry else submitted_subs
+        subs_zero_days = total_subs - subs_with_days
 
         # Write invoice summary row (spans across columns for visibility)
         display_inv = invoice_id if invoice_id != 'NO_INVOICE' else '(No Invoice #)'
         writer.writerow([
             f'--- INVOICE: {display_inv} ---',
-            f'SUMMARY:',
-            f'{len(records)} total',
-            f'{consumers_with_zero_days} with 0 days',
+            f'{total_subs} sub-invoices',
+            f'{subs_zero_days} with 0 days attended',
             '', '', '', '', '', '', '', '', '', '', '', '', '', '', ''
         ])
 
@@ -300,7 +348,18 @@ def download_report():
         # Blank row between invoices
         writer.writerow([])
 
-    writer.writerow(['SUMMARY'])
+    # Invoice-level summary table
+    writer.writerow(['INVOICE SUMMARY'])
+    writer.writerow(['Invoice #', 'Sub Invoices', '0 Days Attended'])
+    for inv_sum in user_results.get('invoice_summary', []):
+        writer.writerow([
+            inv_sum.get('invoice_id') or '(No Invoice #)',
+            inv_sum['total_sub_invoices'],
+            inv_sum['sub_invoices_zero_days']
+        ])
+    writer.writerow([])
+
+    writer.writerow(['OVERALL SUMMARY'])
     writer.writerow(['Time', user_results['timestamp']])
     writer.writerow(['Provider', user_results.get('provider_name', '')])
     writer.writerow(['Total Invoices', len(sorted_invoice_ids)])
