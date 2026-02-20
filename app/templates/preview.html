@@ -78,7 +78,7 @@
 <div class="row mt-4">
     <div class="col-md-4">
         <a href="{{ url_for('main.index') }}" class="btn btn-outline-secondary btn-lg w-100">
-            Cancel / Upload Different File
+            Cancel
         </a>
     </div>
     <div class="col-md-4">
@@ -206,6 +206,242 @@ async function getAvailableInvoices() {
     }
 }
 
+async function zeroOutEntries() {
+    const btn = document.getElementById('zeroOutBtn');
+    const status = document.getElementById('submissionStatus');
+
+    if (!confirm('This will ZERO OUT all entries for the loaded records on the RC portal. Continue?')) {
+        return;
+    }
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Zeroing Out...';
+    status.classList.remove('d-none', 'alert-success', 'alert-danger');
+    status.classList.add('alert-info');
+    status.innerHTML = `
+        <div class="d-flex align-items-center">
+            <div class="spinner-border spinner-border-sm me-2" role="status"></div>
+            <span>Capturing existing values and zeroing out entries...</span>
+        </div>
+    `;
+
+    try {
+        const response = await fetch('{{ url_for("main.zero_out_fm_entries") }}', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                claims: claimsData,
+                provider_id: providerId
+            })
+        });
+
+        const result = await response.json();
+
+        if (result.status === 'error') {
+            status.classList.remove('alert-info');
+            status.classList.add('alert-danger');
+            status.innerHTML = `<strong>Error:</strong> ${result.message}`;
+            btn.disabled = false;
+            btn.innerHTML = 'Retry Zero Out';
+            return;
+        }
+
+        status.classList.remove('alert-info');
+        status.classList.add('alert-success');
+
+        // Build results table
+        let detailsHtml = '';
+        if (result.results && result.results.length > 0) {
+            detailsHtml = `
+                <div class="table-responsive mt-3">
+                    <table class="table table-sm">
+                        <thead class="table-dark">
+                            <tr>
+                                <th>Status</th>
+                                <th>Last Name</th>
+                                <th>First Name</th>
+                                <th>UCI</th>
+                                <th>Invoice ID</th>
+                                <th>Original Values</th>
+                                <th>Days Zeroed</th>
+                                <th>Final Units</th>
+                                <th>Error</th>
+                            </tr>
+                        </thead>
+                        <tbody>`;
+
+            result.results.forEach(r => {
+                let rowClass = 'table-success';
+                let icon = '✓';
+                if (r.status === 'failed') {
+                    rowClass = 'table-danger';
+                    icon = '✗';
+                } else if (r.status === 'skipped') {
+                    rowClass = 'table-warning';
+                    icon = '⊘';
+                }
+
+                detailsHtml += `
+                    <tr class="${rowClass}">
+                        <td><strong>${icon}</strong></td>
+                        <td>${r.last_name || ''}</td>
+                        <td>${r.first_name || ''}</td>
+                        <td><code>${r.uci || ''}</code></td>
+                        <td><small>${r.invoice_id || ''}</small></td>
+                        <td><small>${r.original_values || 'none'}</small></td>
+                        <td>${r.days_zeroed || 0}</td>
+                        <td>${r.final_total || 0}</td>
+                        <td><small>${r.error || ''}</small></td>
+                    </tr>`;
+            });
+
+            detailsHtml += '</tbody></table></div>';
+        }
+
+        const summary = result.summary || {};
+        status.innerHTML = `
+            <strong>Zero Out Complete!</strong> ${result.message}
+            <br>Success: ${summary.success || 0} | Failed: ${summary.failed || 0} | Skipped: ${summary.skipped || 0}
+            ${detailsHtml}
+            <div class="mt-3">
+                <a href="{{ url_for('main.download_fm_report') }}" class="btn btn-primary">
+                    Download Report (CSV)
+                </a>
+            </div>
+        `;
+
+        btn.classList.remove('btn-danger');
+        btn.classList.add('btn-secondary');
+        btn.innerHTML = 'Zeroed Out';
+    } catch (error) {
+        status.classList.remove('alert-info');
+        status.classList.add('alert-danger');
+        status.innerHTML = `<strong>Error:</strong> ${error.message}`;
+        btn.disabled = false;
+        btn.innerHTML = 'Retry Zero Out';
+    }
+}
+
+async function submitFMInvoice() {
+    const btn = document.getElementById('fmSubmitBtn');
+    const status = document.getElementById('submissionStatus');
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>Processing FM Invoice...';
+    status.classList.remove('d-none', 'alert-success', 'alert-danger');
+    status.classList.add('alert-info');
+    status.innerHTML = `
+        <div class="d-flex align-items-center">
+            <div class="spinner-border spinner-border-sm me-2" role="status"></div>
+            <span>Capturing existing values, zeroing out, and entering FM data...</span>
+        </div>
+    `;
+
+    try {
+        const response = await fetch('{{ url_for("main.submit_fm_invoice") }}', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                claims: claimsData,
+                provider_id: providerId
+            })
+        });
+
+        const result = await response.json();
+
+        if (result.status === 'error') {
+            status.classList.remove('alert-info');
+            status.classList.add('alert-danger');
+            status.innerHTML = `<strong>Error:</strong> ${result.message}`;
+            btn.disabled = false;
+            btn.innerHTML = 'Retry FM Invoice';
+            return;
+        }
+
+        status.classList.remove('alert-info');
+        status.classList.add('alert-success');
+
+        // Build results table with capture/zero/enter details
+        let detailsHtml = '';
+        if (result.results && result.results.length > 0) {
+            // Store results for sorting
+            window.fmResults = result.results;
+
+            detailsHtml = `
+                <div class="table-responsive mt-3">
+                    <table class="table table-sm" id="fmResultsTable">
+                        <thead class="table-dark">
+                            <tr>
+                                <th>Status</th>
+                                <th class="sortable-fm" data-sort="last_name" style="cursor:pointer">Last Name <span class="sort-icon">⇅</span></th>
+                                <th class="sortable-fm" data-sort="first_name" style="cursor:pointer">First Name <span class="sort-icon">⇅</span></th>
+                                <th class="sortable-fm" data-sort="uci" style="cursor:pointer">UCI <span class="sort-icon">⇅</span></th>
+                                <th>Invoice ID</th>
+                                <th>Original Values</th>
+                                <th>Days Zeroed</th>
+                                <th>Days Entered</th>
+                                <th>Final Units</th>
+                                <th>Error</th>
+                            </tr>
+                        </thead>
+                        <tbody id="fmResultsBody">`;
+
+            result.results.forEach(r => {
+                let rowClass = 'table-success';
+                let icon = '✓';
+                if (r.status === 'failed') {
+                    rowClass = 'table-danger';
+                    icon = '✗';
+                } else if (r.status === 'skipped') {
+                    rowClass = 'table-warning';
+                    icon = '⊘';
+                }
+
+                detailsHtml += `
+                    <tr class="${rowClass}" data-lastname="${r.last_name || ''}" data-firstname="${r.first_name || ''}" data-uci="${r.uci || ''}">
+                        <td><strong>${icon}</strong></td>
+                        <td>${r.last_name || ''}</td>
+                        <td>${r.first_name || ''}</td>
+                        <td><code>${r.uci || ''}</code></td>
+                        <td><small>${r.invoice_id || ''}</small></td>
+                        <td><small>${r.original_values || 'none'}</small></td>
+                        <td>${r.days_zeroed || 0}</td>
+                        <td>${r.days_entered || 0}</td>
+                        <td>${r.final_total || 0}</td>
+                        <td><small>${r.error || ''}</small></td>
+                    </tr>`;
+            });
+
+            detailsHtml += '</tbody></table></div>';
+
+            // Add sorting after table is rendered
+            setTimeout(initFMTableSort, 100);
+        }
+
+        const summary = result.summary || {};
+        status.innerHTML = `
+            <strong>Complete!</strong> ${result.message}
+            <br>Success: ${summary.success || 0} | Failed: ${summary.failed || 0} | Skipped: ${summary.skipped || 0}
+            ${detailsHtml}
+            <div class="mt-3">
+                <a href="{{ url_for('main.download_fm_report') }}" class="btn btn-primary">
+                    Download FM Report (CSV)
+                </a>
+            </div>
+        `;
+
+        btn.classList.remove('btn-warning');
+        btn.classList.add('btn-secondary');
+        btn.innerHTML = 'FM Invoice Processed';
+    } catch (error) {
+        status.classList.remove('alert-info');
+        status.classList.add('alert-danger');
+        status.innerHTML = `<strong>Error:</strong> ${error.message}`;
+        btn.disabled = false;
+        btn.innerHTML = 'Retry FM Invoice';
+    }
+}
+
 async function submitClaims() {
     const btn = document.getElementById('submitBtn');
     const status = document.getElementById('submissionStatus');
@@ -240,6 +476,21 @@ async function submitClaims() {
 
         let detailsHtml = '';
         if (result.results && result.results.length > 0) {
+            // Group results by invoice number
+            const grouped = {};
+            result.results.forEach(r => {
+                const invId = r.invoice_id || 'NO_INVOICE';
+                if (!grouped[invId]) grouped[invId] = [];
+                grouped[invId].push(r);
+            });
+
+            // Sort invoice numbers
+            const sortedInvoices = Object.keys(grouped).sort((a, b) => {
+                if (a === 'NO_INVOICE') return 1;
+                if (b === 'NO_INVOICE') return -1;
+                return parseInt(a) - parseInt(b);
+            });
+
             detailsHtml = `
                 <div class="table-responsive mt-3">
                     <table class="table table-sm">
@@ -250,28 +501,60 @@ async function submitClaims() {
                                 <th>UCI</th>
                                 <th>SVC Code</th>
                                 <th>Month</th>
-                                <th>Days</th>
+                                <th>Days Entered</th>
+                                <th>Already Had Values</th>
                                 <th>Error</th>
                             </tr>
                         </thead>
                         <tbody>`;
 
-            result.results.forEach(r => {
-                const rowClass = r.success ? 'table-success' : 'table-danger';
-                const icon = r.success ? '✓' : '✗';
-                const days = r.service_days ? r.service_days.join(', ') : (r.days_entered + ' days');
-                const svcCode = (r.svc_code || '') + (r.svc_subcode ? '/' + r.svc_subcode : '');
+            sortedInvoices.forEach(invId => {
+                const records = grouped[invId];
+                const consumersWithZeroDays = records.filter(r => r.days_entered === 0 || !r.days_entered).length;
+                const displayInv = invId === 'NO_INVOICE' ? '(No Invoice #)' : invId;
 
+                // Invoice summary row
                 detailsHtml += `
-                    <tr class="${rowClass}">
-                        <td><strong>${icon}</strong></td>
-                        <td>${r.consumer_name || ''}</td>
-                        <td><code>${r.uci || ''}</code></td>
-                        <td><code>${svcCode}</code></td>
-                        <td>${r.service_month || ''}</td>
-                        <td>${days}</td>
-                        <td>${r.error || ''}</td>
+                    <tr class="table-info">
+                        <td colspan="8" class="fw-bold">
+                            <span class="badge bg-primary me-2">Invoice #${displayInv}</span>
+                            ${records.length} total |
+                            <span class="${consumersWithZeroDays > 0 ? 'text-danger' : ''}">${consumersWithZeroDays} with 0 days</span>
+                        </td>
                     </tr>`;
+
+                // Detail rows for this invoice
+                records.forEach(r => {
+                    let rowClass = r.success ? 'table-success' : 'table-danger';
+                    let icon = r.success ? '✓' : '✗';
+                    if (r.partial) {
+                        rowClass = 'table-warning';
+                        icon = '⚠';
+                    } else if (r.skipped) {
+                        rowClass = 'table-secondary';
+                        icon = '⊘';
+                    }
+                    const days = r.service_days ? r.service_days.join(', ') : (r.days_entered + ' days');
+                    const svcCode = (r.svc_code || '') + (r.svc_subcode ? '/' + r.svc_subcode : '');
+                    const alreadyEntered = r.already_entered_days && r.already_entered_days.length > 0
+                        ? r.already_entered_days.join(', ')
+                        : '-';
+                    const alreadyClass = r.already_entered_days && r.already_entered_days.length > 0
+                        ? 'text-warning fw-bold'
+                        : '';
+
+                    detailsHtml += `
+                        <tr class="${rowClass}">
+                            <td><strong>${icon}</strong></td>
+                            <td>${r.consumer_name || ''}</td>
+                            <td><code>${r.uci || ''}</code></td>
+                            <td><code>${svcCode}</code></td>
+                            <td>${r.service_month || ''}</td>
+                            <td>${days}</td>
+                            <td class="${alreadyClass}">${alreadyEntered}</td>
+                            <td><small>${r.error || ''}</small></td>
+                        </tr>`;
+                });
             });
 
             detailsHtml += '</tbody></table></div>';
@@ -298,6 +581,52 @@ async function submitClaims() {
         btn.disabled = false;
         btn.innerHTML = 'Retry Submission';
     }
+}
+
+// FM Results table sorting
+function initFMTableSort() {
+    const table = document.getElementById('fmResultsTable');
+    if (!table) return;
+
+    const headers = table.querySelectorAll('th.sortable-fm');
+    const tbody = table.querySelector('#fmResultsBody');
+    let currentSort = { column: null, direction: 'asc' };
+
+    headers.forEach(header => {
+        header.addEventListener('click', function() {
+            const sortKey = this.dataset.sort;
+
+            if (currentSort.column === sortKey) {
+                currentSort.direction = currentSort.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                currentSort.column = sortKey;
+                currentSort.direction = 'asc';
+            }
+
+            // Update header styles
+            headers.forEach(h => {
+                h.classList.remove('asc', 'desc');
+                h.querySelector('.sort-icon').textContent = '⇅';
+            });
+            this.classList.add(currentSort.direction);
+            this.querySelector('.sort-icon').textContent = currentSort.direction === 'asc' ? '▲' : '▼';
+
+            // Sort rows
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            const dataAttr = sortKey === 'last_name' ? 'lastname' : sortKey === 'first_name' ? 'firstname' : 'uci';
+
+            rows.sort((a, b) => {
+                let valA = (a.dataset[dataAttr] || '').toLowerCase();
+                let valB = (b.dataset[dataAttr] || '').toLowerCase();
+
+                if (valA < valB) return currentSort.direction === 'asc' ? -1 : 1;
+                if (valA > valB) return currentSort.direction === 'asc' ? 1 : -1;
+                return 0;
+            });
+
+            rows.forEach(row => tbody.appendChild(row));
+        });
+    });
 }
 </script>
 {% endblock %}

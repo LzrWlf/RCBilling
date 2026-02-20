@@ -36,15 +36,15 @@
                 {% endif %}
 
                 <div class="table-responsive">
-                    <table class="table table-striped table-hover">
+                    <table class="table table-striped table-hover" id="invoiceTable">
                         <thead class="table-dark">
                             <tr>
-                                {% if scan_all %}<th>Provider SPN</th>{% endif %}
-                                <th>Last Name</th>
-                                <th>First Name</th>
-                                <th>UCI</th>
-                                <th>Service Month</th>
-                                <th>Service Code</th>
+                                {% if scan_all %}<th data-sort="provider_spn" class="sortable">Provider SPN <span class="sort-icon">⇅</span></th>{% endif %}
+                                <th data-sort="last_name" class="sortable">Last Name <span class="sort-icon">⇅</span></th>
+                                <th data-sort="first_name" class="sortable">First Name <span class="sort-icon">⇅</span></th>
+                                <th data-sort="uci" class="sortable">UCI <span class="sort-icon">⇅</span></th>
+                                <th data-sort="service_month" class="sortable">Service Month <span class="sort-icon">⇅</span></th>
+                                <th data-sort="svc_code" class="sortable">Service Code <span class="sort-icon">⇅</span></th>
                                 <th>SVC Subcode</th>
                                 <th>Auth #</th>
                                 <th>Auth Units</th>
@@ -53,7 +53,12 @@
                         </thead>
                         <tbody>
                             {% for inv in invoices %}
-                            <tr>
+                            <tr data-provider="{{ inv.provider_spn or '' }}"
+                                data-lastname="{{ inv.last_name }}"
+                                data-firstname="{{ inv.first_name }}"
+                                data-uci="{{ inv.uci }}"
+                                data-month="{{ inv.service_month }}"
+                                data-svc="{{ inv.svc_code }}">
                                 {% if scan_all %}<td><code>{{ inv.provider_spn or '' }}</code></td>{% endif %}
                                 <td>{{ inv.last_name }}</td>
                                 <td>{{ inv.first_name }}</td>
@@ -78,4 +83,91 @@
         </div>
     </div>
 </div>
+
+<style>
+    .sortable {
+        cursor: pointer;
+        user-select: none;
+    }
+    .sortable:hover {
+        background-color: #495057;
+    }
+    .sort-icon {
+        opacity: 0.5;
+        margin-left: 5px;
+    }
+    .sortable.asc .sort-icon {
+        opacity: 1;
+    }
+    .sortable.asc .sort-icon::after {
+        content: ' ▲';
+    }
+    .sortable.desc .sort-icon {
+        opacity: 1;
+    }
+    .sortable.desc .sort-icon::after {
+        content: ' ▼';
+    }
+</style>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    const table = document.getElementById('invoiceTable');
+    if (!table) return;
+
+    const headers = table.querySelectorAll('th.sortable');
+    const tbody = table.querySelector('tbody');
+    let currentSort = { column: null, direction: 'asc' };
+
+    const dataMap = {
+        'provider_spn': 'provider',
+        'last_name': 'lastname',
+        'first_name': 'firstname',
+        'uci': 'uci',
+        'service_month': 'month',
+        'svc_code': 'svc'
+    };
+
+    headers.forEach(header => {
+        header.addEventListener('click', function() {
+            const sortKey = this.dataset.sort;
+            const dataAttr = dataMap[sortKey];
+
+            if (currentSort.column === sortKey) {
+                currentSort.direction = currentSort.direction === 'asc' ? 'desc' : 'asc';
+            } else {
+                currentSort.column = sortKey;
+                currentSort.direction = 'asc';
+            }
+
+            headers.forEach(h => {
+                h.classList.remove('asc', 'desc');
+                h.querySelector('.sort-icon').textContent = '⇅';
+            });
+            this.classList.add(currentSort.direction);
+            this.querySelector('.sort-icon').textContent = '';
+
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            rows.sort((a, b) => {
+                let valA = (a.dataset[dataAttr] || '').toLowerCase();
+                let valB = (b.dataset[dataAttr] || '').toLowerCase();
+
+                if (sortKey === 'uci' || sortKey === 'svc_code') {
+                    const numA = parseInt(valA) || 0;
+                    const numB = parseInt(valB) || 0;
+                    if (numA !== numB) {
+                        return currentSort.direction === 'asc' ? numA - numB : numB - numA;
+                    }
+                }
+
+                if (valA < valB) return currentSort.direction === 'asc' ? -1 : 1;
+                if (valA > valB) return currentSort.direction === 'asc' ? 1 : -1;
+                return 0;
+            });
+
+            rows.forEach(row => tbody.appendChild(row));
+        });
+    });
+});
+</script>
 {% endblock %}

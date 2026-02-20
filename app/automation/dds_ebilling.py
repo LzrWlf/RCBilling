@@ -50,6 +50,7 @@ class SubmissionResult:
     partial: bool = False  # True if some days entered but not all
     consumer_name: str = ""
     uci: str = ""
+    invoice_id: str = ""  # Invoice number from portal
     days_entered: int = 0
     days_expected: int = 0  # Total days expected from CSV
     unavailable_days: List[int] = None  # Days that were greyed out/disabled
@@ -63,6 +64,43 @@ class SubmissionResult:
     # Billing data from CSV invoice
     invoice_units: float = 0.0
     invoice_amount: float = 0.0
+
+
+@dataclass
+class FMUploadResult:
+    """Result of FM invoice upload with capture-zero-enter workflow"""
+    record_index: int
+    success: bool
+    uci: str = ""
+    last_name: str = ""
+    first_name: str = ""
+    service_month: str = ""
+    svc_code: str = ""
+    svc_subcode: str = ""
+    auth_number: str = ""
+    invoice_id: str = ""
+
+    # Before/After tracking
+    original_values: Dict[int, float] = None  # {day: units} BEFORE changes
+    final_values: Dict[int, float] = None     # {day: units} AFTER changes
+    original_total_units: float = 0.0
+    final_total_units: float = 0.0
+    final_gross_amount: float = 0.0
+
+    # Operation details
+    fm_service_days: List[int] = None  # Days from FM invoice
+    days_zeroed: List[int] = None      # Days that were zeroed out
+    days_entered: List[int] = None     # Days where FM values were entered
+    days_unavailable: List[int] = None # Days that couldn't be modified
+
+    # Validation
+    validation_passed: bool = False
+    validation_errors: List[str] = None
+
+    # Error/Retry
+    error_message: str = None
+    retry_count: int = 0
+    retry_reason: str = None
 
 
 class DDSeBillingBot:
@@ -106,10 +144,9 @@ class DDSeBillingBot:
         """Start browser session"""
         logger.info(f"Starting browser (headless={self.headless})...")
         self.playwright = sync_playwright().start()
-        # Use bundled Chromium (no channel) for Docker/production compatibility
-        self.browser = self.playwright.chromium.launch(
+        # Use Firefox for better macOS compatibility
+        self.browser = self.playwright.firefox.launch(
             headless=self.headless,
-            args=['--disable-blink-features=AutomationControlled', '--no-sandbox']
         )
         self.context = self.browser.new_context()
         self.page = self.context.new_page()
@@ -3279,6 +3316,7 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
             matched_inv = record.get('_matched_inv', {})
             invoice_internal_id = matched_inv.get('invoice_internal_id', '')
             consumer_line_id = matched_inv.get('consumer_line_id', '')
+            invoice_id = matched_inv.get('invoice_id', '')
 
             logger.info(f"Processing: {consumer_name} (UCI: {uci}, line_id: {consumer_line_id})")
 
@@ -3488,6 +3526,7 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
                     partial=is_partial,
                     consumer_name=consumer_name,
                     uci=uci,
+                    invoice_id=invoice_id,
                     days_entered=days_entered,
                     days_expected=days_expected,
                     unavailable_days=unavailable_days,
@@ -3507,6 +3546,7 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
                     success=False,
                     consumer_name=consumer_name,
                     uci=uci,
+                    invoice_id=invoice_id,
                     days_expected=len(service_days),
                     error_message=str(e),
                     invoice_units=invoice_units,
@@ -3518,4 +3558,566 @@ def submit_to_ebilling_fast(records: List[Dict], username: str, password: str,
         return [SubmissionResult(success=False, error_message=f"HTTP error: {e}")]
 
     logger.info(f"Fast submit complete: {len(results)} results")
+    return results
+
+
+# =============================================================================
+# FM INVOICE UPLOAD FUNCTIONS (Capture-Zero-Enter workflow)
+# =============================================================================
+
+def capture_calendar_values(calendar_html: str) -> Dict[int, float]:
+    """
+    Parse calendar HTML and extract current values for all days C1-C31.
+
+    Args:
+        calendar_html: Raw HTML from /invoices/unitcalendar endpoint
+
+    Returns:
+        Dict mapping day number (1-31) to current unit value
+    """
+    import re
+    day_values = {}
+
+    # Extract ALL input fields
+    for input_match in re.finditer(r'<input\s+([^>]*)/?>', calendar_html, re.IGNORECASE):
+        attrs_str = input_match.group(1)
+        name_m = re.search(r'name=["\']([^"\']*)["\']', attrs_str)
+        value_m = re.search(r'value=["\']([^"\']*)["\']', attrs_str)
+        if not value_m:
+            value_m = re.search(r'value=(\S+)', attrs_str)
+
+        if name_m:
+            name = name_m.group(1)
+            # Check if it's a day field (C1-C31)
+            if re.match(r'^C(\d+)$', name):
+                day_num = int(name[1:])
+                if 1 <= day_num <= 31:
+                    value = value_m.group(1) if value_m else ''
+                    try:
+                        day_values[day_num] = float(value) if value.strip() else 0.0
+                    except ValueError:
+                        day_values[day_num] = 0.0
+
+    return day_values
+
+
+def validate_fm_record(record: Dict, inventory_by_uci: Dict, inventory_by_key: Dict) -> Tuple[bool, List[str], Optional[Dict]]:
+    """
+    Validate FM invoice record against RC portal inventory.
+
+    Args:
+        record: FM invoice record dict
+        inventory_by_uci: Dict keyed by (uci, normalized_month)
+        inventory_by_key: Dict keyed by (svc_code, normalized_month)
+
+    Returns:
+        Tuple of (is_valid, list_of_error_messages, matched_inventory_item)
+    """
+    errors = []
+    matched_item = None
+
+    uci = str(record.get('uci', '')).strip()
+    service_month = record.get('service_month', '') or record.get('svc_month_year', '')
+    svc_code = str(record.get('svc_code', '')).strip()
+    service_days = record.get('service_days', [])
+
+    # Normalize service month
+    normalized_month = _normalize_month(service_month)
+
+    # Check 1: UCI and service_days present
+    if not uci:
+        errors.append("Missing UCI")
+    if not service_days:
+        errors.append("No service days specified")
+
+    # Check 2: Day range valid (1-31)
+    invalid_days = [d for d in service_days if d < 1 or d > 31]
+    if invalid_days:
+        errors.append(f"Invalid days outside 1-31: {invalid_days}")
+
+    # Check 3: Match against inventory
+    # Try direct UCI + month match first
+    key = (uci, normalized_month)
+    if key in inventory_by_uci:
+        matched_item = inventory_by_uci[key]
+    else:
+        # Try service code + month match (for multi-consumer invoices)
+        svc_key = (svc_code, normalized_month)
+        matching_invoices = inventory_by_key.get(svc_key, [])
+
+        if not matching_invoices:
+            errors.append(f"No invoice found for SVC {svc_code}, Month {normalized_month}")
+        else:
+            # Look for matching UCI within multi-consumer invoices
+            for inv in matching_invoices:
+                if inv.get('uci') == uci:
+                    matched_item = inv
+                    break
+
+            if not matched_item:
+                # Check if any is a multi-consumer folder (empty UCI)
+                for inv in matching_invoices:
+                    if not inv.get('uci') or inv.get('has_uci') == False:
+                        matched_item = inv
+                        matched_item['_is_multi_consumer'] = True
+                        break
+
+                if not matched_item:
+                    errors.append(f"UCI {uci} not found in available invoices for SVC {svc_code}, Month {normalized_month}")
+
+    return (len(errors) == 0, errors, matched_item)
+
+
+def submit_fm_invoice_fast(
+    records: List[Dict],
+    username: str,
+    password: str,
+    provider_name: str = None,
+    regional_center: str = "ELARC",
+    portal_url: str = None,
+    max_retries: int = 3,
+    zero_only: bool = False
+) -> List[FMUploadResult]:
+    """
+    Submit Filemaker invoice with capture-zero-enter workflow.
+
+    This function:
+    1. Logs in via Playwright (popup), extracts session cookie
+    2. Uses HTTP requests for all subsequent operations
+    3. For each record:
+       - CAPTURES existing calendar values
+       - ZEROS OUT all existing entries
+       - ENTERS FM invoice values (unless zero_only=True)
+       - Clicks UPDATE (not SUBMIT)
+
+    Args:
+        records: Parsed FM invoice records
+        username: Portal credentials
+        password: Portal credentials
+        provider_name: SPN ID (uses first record's spn_id if None)
+        regional_center: RC code
+        portal_url: Override URL
+        max_retries: Max retry attempts per record
+        zero_only: If True, only zero out entries without entering new values
+
+    Returns:
+        List of FMUploadResult objects
+    """
+    import requests as req
+    import re
+
+    results = []
+
+    if not records:
+        return results
+
+    # Determine provider SPN ID
+    spn_id = provider_name or records[0].get('spn_id', '')
+
+    # Get portal URL
+    base_url = portal_url or RC_PORTAL_URLS.get(regional_center, RC_PORTAL_URLS['ELARC'])
+    base_url = base_url.replace('/login', '')
+
+    mode_str = "ZERO ONLY" if zero_only else "Capture-Zero-Enter"
+    logger.info(f"FM Invoice Fast Submit ({mode_str}): {len(records)} records for provider {spn_id}")
+    logger.info(f"Using portal: {base_url}")
+
+    try:
+        # Phase 1: Login via Playwright to get session cookie
+        logger.info("Phase 1: Logging in via Playwright...")
+        session_cookie = None
+
+        with DDSeBillingBot(username, password, headless=True,
+                           regional_center=regional_center, portal_url=portal_url) as bot:
+            login_success = bot.login()
+            if not login_success:
+                return [FMUploadResult(
+                    record_index=0,
+                    success=False,
+                    error_message="Login failed - check credentials"
+                )]
+
+            # Extract PHPSESSID cookie
+            cookies = bot.context.cookies()
+            for c in cookies:
+                if c['name'] == 'PHPSESSID':
+                    session_cookie = c['value']
+                    break
+
+            # Close browser WITHOUT logging out
+            bot.browser.close()
+            bot.playwright.stop()
+            bot.browser = None
+            bot.playwright = None
+
+        if not session_cookie:
+            return [FMUploadResult(
+                record_index=0,
+                success=False,
+                error_message="Could not extract session cookie"
+            )]
+
+        logger.info(f"Got session cookie: {session_cookie[:8]}...")
+
+        # Phase 2: Set up HTTP session
+        session = req.Session()
+        session.cookies.set('PHPSESSID', session_cookie, domain='ebilling.dds.ca.gov')
+        session.verify = False
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        })
+
+        # Phase 3: Get list of providers and select the right one
+        logger.info("Phase 2: Selecting provider...")
+        resp = session.get(f'{base_url}/home/dashboardspngrid', timeout=30)
+        providers_data = resp.json() if resp.status_code == 200 else {}
+
+        # Find matching provider
+        provider_internal_id = None
+        for row in providers_data.get('rows', []):
+            row_spn = row.get('SPNID', '')
+            if row_spn == spn_id:
+                provider_internal_id = row.get('ID')
+                break
+
+        if not provider_internal_id:
+            # Use first provider if not found
+            rows = providers_data.get('rows', [])
+            if rows:
+                provider_internal_id = rows[0].get('ID')
+                spn_id = rows[0].get('SPNID', spn_id)
+
+        # Select provider
+        if provider_internal_id:
+            session.post(f'{base_url}/home/setspn', data={'spnid': provider_internal_id}, timeout=30)
+
+        # Phase 4: Build inventory for matching
+        logger.info("Phase 3: Building invoice inventory...")
+        session.get(f'{base_url}/invoices/invoice', timeout=30)
+        resp = session.get(f'{base_url}/invoices/invoicegrid', timeout=30)
+
+        inventory_by_uci = {}
+        inventory_by_key = defaultdict(list)
+        invoice_grid = resp.json() if resp.status_code == 200 else {}
+
+        for row in invoice_grid.get('rows', []):
+            invoice_id = str(row.get('BOINVN', ''))
+            invoice_internal_id = str(row.get('ID', ''))
+            svc_code = str(row.get('BOSVCD', ''))
+            svc_month = row.get('BOSVMY', '')
+            normalized_month = _normalize_month(svc_month)
+            uci = str(row.get('BOCLID', '')).strip()
+
+            inv_item = {
+                'invoice_id': invoice_id,
+                'invoice_internal_id': invoice_internal_id,
+                'svc_code': svc_code,
+                'svc_month': svc_month,
+                'uci': uci,
+                'has_uci': bool(uci),
+            }
+
+            if uci:
+                inventory_by_uci[(uci, normalized_month)] = inv_item
+            inventory_by_key[(svc_code, normalized_month)].append(inv_item)
+
+        logger.info(f"  Built inventory: {len(inventory_by_uci)} by UCI, {len(inventory_by_key)} by SVC/month")
+
+        # Phase 5: Process each record
+        logger.info("Phase 4: Processing records...")
+
+        for idx, record in enumerate(records):
+            uci = str(record.get('uci', '')).strip()
+            last_name = str(record.get('lastname', '')).strip()
+            first_name = str(record.get('firstname', '')).strip()
+            service_month = record.get('service_month', '') or record.get('svc_month_year', '')
+            svc_code = str(record.get('svc_code', '')).strip()
+            svc_subcode = str(record.get('svc_subcode', '')).strip()
+            auth_number = str(record.get('auth_number', '')).strip()
+            service_days = record.get('service_days', [])
+
+            logger.info(f"  [{idx+1}/{len(records)}] {last_name}, {first_name} (UCI: {uci}), {len(service_days)} days")
+
+            # Validate record
+            is_valid, errors, matched_item = validate_fm_record(record, inventory_by_uci, inventory_by_key)
+
+            if not is_valid:
+                logger.warning(f"    Validation failed: {errors}")
+                results.append(FMUploadResult(
+                    record_index=idx,
+                    success=False,
+                    uci=uci,
+                    last_name=last_name,
+                    first_name=first_name,
+                    service_month=service_month,
+                    svc_code=svc_code,
+                    svc_subcode=svc_subcode,
+                    auth_number=auth_number,
+                    fm_service_days=service_days,
+                    validation_passed=False,
+                    validation_errors=errors,
+                    error_message=f"SKIPPED: {'; '.join(errors)}"
+                ))
+                continue
+
+            # Get invoice details
+            invoice_internal_id = matched_item.get('invoice_internal_id', '')
+
+            # Open invoice to get consumer line ID
+            resp = session.post(f'{base_url}/invoices/invoiceview', data={
+                'invoiceid': invoice_internal_id,
+                'updatemode': 'Y',
+                'selectallrecords': '',
+                'invoiceno': '',
+                'TARGET': ''
+            }, timeout=30)
+
+            # Get consumer lines from invoice view
+            resp = session.get(f'{base_url}/invoices/invoiceviewgrid/invoiceid/{invoice_internal_id}/mode/A', timeout=30)
+            consumer_lines = resp.json() if resp.status_code == 200 else {}
+
+            # Find matching consumer line
+            consumer_line_id = None
+            for row in consumer_lines.get('rows', []):
+                row_uci = str(row.get('BOCLID', '')).strip()
+                if row_uci == uci:
+                    consumer_line_id = str(row.get('ID', ''))
+                    break
+
+            if not consumer_line_id:
+                logger.warning(f"    Could not find consumer line for UCI {uci}")
+                results.append(FMUploadResult(
+                    record_index=idx,
+                    success=False,
+                    uci=uci,
+                    last_name=last_name,
+                    first_name=first_name,
+                    service_month=service_month,
+                    svc_code=svc_code,
+                    invoice_id=matched_item.get('invoice_id', ''),
+                    fm_service_days=service_days,
+                    validation_passed=True,
+                    error_message=f"Consumer UCI {uci} not found in invoice detail"
+                ))
+                continue
+
+            # === CAPTURE-ZERO-ENTER WORKFLOW ===
+            retry_count = 0
+            retry_reason = None
+
+            while retry_count <= max_retries:
+                try:
+                    # Step 1: Get calendar page
+                    resp = session.post(f'{base_url}/invoices/unitcalendar', data={
+                        'invoicedetid': consumer_line_id,
+                        'updatemode': 'Y',
+                        'invoiceid': invoice_internal_id,
+                    }, timeout=30)
+                    calendar_html = resp.text
+
+                    # Step 2: CAPTURE existing values
+                    original_values = capture_calendar_values(calendar_html)
+                    original_total = sum(original_values.values())
+                    days_with_values = [d for d, v in original_values.items() if v > 0]
+                    logger.info(f"    Captured existing values: {len(days_with_values)} days with values, total={original_total}")
+
+                    # Step 3: Extract ALL form fields
+                    form_data = {}
+                    for input_match in re.finditer(r'<input\s+([^>]*)/?>', calendar_html, re.IGNORECASE):
+                        attrs_str = input_match.group(1)
+                        name_m = re.search(r'name=["\']([^"\']*)["\']', attrs_str)
+                        value_m = re.search(r'value=["\']([^"\']*)["\']', attrs_str)
+                        if not value_m:
+                            value_m = re.search(r'value=(\S+)', attrs_str)
+                        if name_m:
+                            name = name_m.group(1)
+                            value = value_m.group(1) if value_m else ''
+                            form_data[name] = value
+
+                    # Get unit rate from page
+                    rate_match = re.search(r'monthlyrate\s*=\s*([0-9.]+)', calendar_html)
+                    if not rate_match:
+                        rate_match = re.search(r'unitrate\s*=\s*([0-9.]+)', calendar_html, re.IGNORECASE)
+                    unit_rate = float(rate_match.group(1)) if rate_match else 0.0
+
+                    # Find max day available
+                    max_day = max((d for d in original_values.keys()), default=31)
+
+                    # Step 4: ZERO OUT all days
+                    days_zeroed = []
+                    for day_num in range(1, max_day + 1):
+                        key = f'C{day_num}'
+                        if key in form_data:
+                            if original_values.get(day_num, 0) > 0:
+                                days_zeroed.append(day_num)
+                            form_data[key] = '0'
+
+                    # Update totals
+                    form_data['UNITSUM'] = '0'
+                    form_data['TOTALUNITS'] = '0'
+                    form_data['GROSSAMT'] = '0'
+                    form_data['NETAMT'] = '0'
+                    form_data['invoicedetid'] = consumer_line_id
+                    form_data['invoiceid'] = invoice_internal_id
+                    form_data['updatemode'] = 'Y'
+
+                    # Submit zeroed form
+                    logger.info(f"    Zeroing out {len(days_zeroed)} days...")
+                    resp = session.post(f'{base_url}/invoices/unitcalendarupdate', data=form_data, timeout=30)
+
+                    days_entered = []
+                    days_unavailable = []
+                    final_total = 0.0
+                    gross_amount = 0.0
+                    final_values = {}
+
+                    if zero_only:
+                        # Zero only mode - capture final values after zeroing and done
+                        resp = session.post(f'{base_url}/invoices/unitcalendar', data={
+                            'invoicedetid': consumer_line_id,
+                            'updatemode': 'Y',
+                            'invoiceid': invoice_internal_id,
+                        }, timeout=30)
+                        final_values = capture_calendar_values(resp.text)
+                        final_total = sum(final_values.values())
+                        logger.info(f"    Zero only - Final: {final_total} units (should be 0)")
+                    else:
+                        # Step 5: Get fresh calendar
+                        resp = session.post(f'{base_url}/invoices/unitcalendar', data={
+                            'invoicedetid': consumer_line_id,
+                            'updatemode': 'Y',
+                            'invoiceid': invoice_internal_id,
+                        }, timeout=30)
+                        calendar_html = resp.text
+
+                        # Re-extract form fields
+                        form_data = {}
+                        for input_match in re.finditer(r'<input\s+([^>]*)/?>', calendar_html, re.IGNORECASE):
+                            attrs_str = input_match.group(1)
+                            name_m = re.search(r'name=["\']([^"\']*)["\']', attrs_str)
+                            value_m = re.search(r'value=["\']([^"\']*)["\']', attrs_str)
+                            if not value_m:
+                                value_m = re.search(r'value=(\S+)', attrs_str)
+                            if name_m:
+                                name = name_m.group(1)
+                                value = value_m.group(1) if value_m else ''
+                                form_data[name] = value
+
+                        # Step 6: ENTER FM values
+                        for day in service_days:
+                            key = f'C{day}'
+                            if key in form_data:
+                                form_data[key] = '1'  # 1 unit per day
+                                days_entered.append(day)
+                            else:
+                                days_unavailable.append(day)
+
+                        # Calculate new totals
+                        total_units = float(len(days_entered))
+                        gross_amount = round(total_units * unit_rate, 2) if unit_rate else 0.0
+
+                        form_data['UNITSUM'] = str(total_units)
+                        form_data['TOTALUNITS'] = str(total_units)
+                        form_data['GROSSAMT'] = str(gross_amount)
+                        form_data['NETAMT'] = str(gross_amount)
+                        form_data['invoicedetid'] = consumer_line_id
+                        form_data['invoiceid'] = invoice_internal_id
+                        form_data['updatemode'] = 'Y'
+
+                        # Submit with FM values (UPDATE)
+                        logger.info(f"    Entering {len(days_entered)} FM days...")
+                        resp = session.post(f'{base_url}/invoices/unitcalendarupdate', data=form_data, timeout=30)
+
+                        # Step 7: Capture final values
+                        final_values = capture_calendar_values(resp.text)
+                        final_total = sum(final_values.values())
+
+                        logger.info(f"    Final: {final_total} units, gross=${gross_amount}")
+
+                    # Success!
+                    results.append(FMUploadResult(
+                        record_index=idx,
+                        success=True,
+                        uci=uci,
+                        last_name=last_name,
+                        first_name=first_name,
+                        service_month=service_month,
+                        svc_code=svc_code,
+                        svc_subcode=svc_subcode,
+                        auth_number=auth_number,
+                        invoice_id=matched_item.get('invoice_id', ''),
+                        original_values=original_values,
+                        final_values=final_values,
+                        original_total_units=original_total,
+                        final_total_units=final_total,
+                        final_gross_amount=gross_amount,
+                        fm_service_days=service_days,
+                        days_zeroed=days_zeroed,
+                        days_entered=days_entered,
+                        days_unavailable=days_unavailable,
+                        validation_passed=True,
+                        retry_count=retry_count,
+                        retry_reason=retry_reason
+                    ))
+                    break  # Success, exit retry loop
+
+                except req.Timeout:
+                    retry_reason = "timeout"
+                    retry_count += 1
+                    logger.warning(f"    Timeout, retry {retry_count}/{max_retries}")
+                    time.sleep(2 ** retry_count)
+
+                except req.ConnectionError:
+                    retry_reason = "connection_error"
+                    retry_count += 1
+                    logger.warning(f"    Connection error, retry {retry_count}/{max_retries}")
+                    time.sleep(2 ** retry_count)
+
+                except Exception as e:
+                    logger.error(f"    Error: {e}")
+                    results.append(FMUploadResult(
+                        record_index=idx,
+                        success=False,
+                        uci=uci,
+                        last_name=last_name,
+                        first_name=first_name,
+                        service_month=service_month,
+                        svc_code=svc_code,
+                        invoice_id=matched_item.get('invoice_id', ''),
+                        fm_service_days=service_days,
+                        validation_passed=True,
+                        error_message=str(e),
+                        retry_count=retry_count,
+                        retry_reason=retry_reason
+                    ))
+                    break
+
+            else:
+                # Max retries exceeded
+                results.append(FMUploadResult(
+                    record_index=idx,
+                    success=False,
+                    uci=uci,
+                    last_name=last_name,
+                    first_name=first_name,
+                    service_month=service_month,
+                    svc_code=svc_code,
+                    invoice_id=matched_item.get('invoice_id', '') if matched_item else '',
+                    fm_service_days=service_days,
+                    validation_passed=True,
+                    error_message=f"Max retries ({max_retries}) exceeded: {retry_reason}",
+                    retry_count=retry_count,
+                    retry_reason=retry_reason
+                ))
+
+    except req.RequestException as e:
+        logger.error(f"FM submit HTTP error: {e}")
+        return [FMUploadResult(
+            record_index=0,
+            success=False,
+            error_message=f"HTTP error: {e}"
+        )]
+
+    logger.info(f"FM submit complete: {len(results)} results")
     return results

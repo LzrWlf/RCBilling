@@ -6,7 +6,7 @@ import csv
 import io
 from datetime import datetime
 from app.csv_parser import parse_rc_billing_csv, records_to_dict
-from app.automation.dds_ebilling import submit_to_ebilling, submit_to_ebilling_fast, scrape_invoice_inventory, scrape_all_providers_inventory, scrape_all_providers_inventory_fast
+from app.automation.dds_ebilling import submit_to_ebilling, submit_to_ebilling_fast, scrape_invoice_inventory, scrape_all_providers_inventory, scrape_all_providers_inventory_fast, submit_fm_invoice_fast, FMUploadResult
 from app.models import db, Provider, SubmissionLog
 
 _last_submission_results = {}
@@ -121,6 +121,7 @@ def submit_claims():
             result_details.append({
                 'consumer_name': r.consumer_name or orig.get('consumer_name', ''),
                 'uci': r.uci or orig.get('uci', ''),
+                'invoice_id': r.invoice_id or '',
                 'auth_number': orig.get('auth_number', ''),
                 'svc_code': orig.get('svc_code', ''),
                 'svc_subcode': orig.get('svc_subcode', ''),
@@ -210,69 +211,99 @@ def download_report():
     output = io.StringIO()
     writer = csv.writer(output)
 
-    # Header row with invoice vs RC portal comparison columns
+    # Header row with invoice number column
     writer.writerow([
-        'Status', 'Consumer Name', 'UCI', 'Auth Number', 'SVC Code', 'SVC Subcode',
+        'Invoice #', 'Status', 'Consumer Name', 'UCI', 'Auth Number', 'SVC Code', 'SVC Subcode',
         'Service Month', 'Service Days', 'Days Entered', 'Days Expected', 'Unavailable Days', 'Already Entered',
         'Invoice Units', 'Invoice Amount',  # From CSV (may be empty)
         'RC Units', 'RC Gross', 'RC Net', 'RC Unit Rate',  # From RC Portal
         'Error'
     ])
 
-    # Sort: success first, then partial, then skipped, then failed
-    def sort_key(x):
-        if x['success'] and not x.get('partial'):
-            return (0, x['consumer_name'])
-        elif x.get('partial'):
-            return (1, x['consumer_name'])
-        elif x.get('skipped'):
-            return (2, x['consumer_name'])
-        else:
-            return (3, x['consumer_name'])
+    # Group results by invoice number
+    from collections import defaultdict
+    invoices_grouped = defaultdict(list)
+    for r in user_results['results']:
+        invoice_id = r.get('invoice_id', '') or 'NO_INVOICE'
+        invoices_grouped[invoice_id].append(r)
 
-    for r in sorted(user_results['results'], key=sort_key):
-        # Format billing values - show empty string if zero/not available
-        inv_units = r.get('invoice_units', 0)
-        inv_amount = r.get('invoice_amount', 0)
-        rc_units = r.get('rc_units', 0)
-        rc_gross = r.get('rc_gross', 0)
-        rc_net = r.get('rc_net', 0)
-        rc_rate = r.get('rc_unit_rate', 0)
+    # Sort invoice numbers (numeric sort if possible)
+    def invoice_sort_key(inv_id):
+        try:
+            return (0, int(inv_id))
+        except (ValueError, TypeError):
+            return (1, str(inv_id))
 
-        # Determine status
-        if r['success'] and not r.get('partial'):
-            status = 'SUCCESS'
-        elif r.get('partial'):
-            status = 'PARTIAL'
-        elif r.get('skipped'):
-            status = 'SKIPPED'
-        else:
-            status = 'FAILED'
+    sorted_invoice_ids = sorted(invoices_grouped.keys(), key=invoice_sort_key)
 
-        # Format unavailable days and already entered days
-        unavailable = r.get('unavailable_days', [])
-        unavailable_str = ', '.join(str(d) for d in unavailable) if unavailable else ''
-        already_entered = r.get('already_entered_days', [])
-        already_entered_str = ', '.join(str(d) for d in already_entered) if already_entered else ''
+    # Write rows grouped by invoice with summary rows
+    for invoice_id in sorted_invoice_ids:
+        records = invoices_grouped[invoice_id]
 
+        # Sort records within invoice by consumer name
+        records_sorted = sorted(records, key=lambda x: x.get('consumer_name', ''))
+
+        # Count consumers with 0 days entered
+        consumers_with_zero_days = sum(1 for r in records if r.get('days_entered', 0) == 0)
+
+        # Write invoice summary row (spans across columns for visibility)
+        display_inv = invoice_id if invoice_id != 'NO_INVOICE' else '(No Invoice #)'
         writer.writerow([
-            status,
-            r['consumer_name'], r['uci'], r['auth_number'], r['svc_code'], r['svc_subcode'],
-            r['service_month'], ', '.join(str(d) for d in r.get('service_days', [])),
-            r['days_entered'], r.get('expected_days', ''), unavailable_str, already_entered_str,
-            f'{inv_units:.2f}' if inv_units else '',
-            f'${inv_amount:.2f}' if inv_amount else '',
-            f'{rc_units:.2f}' if rc_units else '',
-            f'${rc_gross:.2f}' if rc_gross else '',
-            f'${rc_net:.2f}' if rc_net else '',
-            f'${rc_rate:.2f}' if rc_rate else '',
-            r['error']
+            f'--- INVOICE: {display_inv} ---',
+            f'SUMMARY:',
+            f'{len(records)} total',
+            f'{consumers_with_zero_days} with 0 days',
+            '', '', '', '', '', '', '', '', '', '', '', '', '', '', ''
         ])
 
-    writer.writerow([])
+        # Write detail rows for this invoice
+        for r in records_sorted:
+            # Format billing values
+            inv_units = r.get('invoice_units', 0)
+            inv_amount = r.get('invoice_amount', 0)
+            rc_units = r.get('rc_units', 0)
+            rc_gross = r.get('rc_gross', 0)
+            rc_net = r.get('rc_net', 0)
+            rc_rate = r.get('rc_unit_rate', 0)
+
+            # Determine status
+            if r['success'] and not r.get('partial'):
+                status = 'SUCCESS'
+            elif r.get('partial'):
+                status = 'PARTIAL'
+            elif r.get('skipped'):
+                status = 'SKIPPED'
+            else:
+                status = 'FAILED'
+
+            # Format unavailable days and already entered days
+            unavailable = r.get('unavailable_days', [])
+            unavailable_str = ', '.join(str(d) for d in unavailable) if unavailable else ''
+            already_entered = r.get('already_entered_days', [])
+            already_entered_str = ', '.join(str(d) for d in already_entered) if already_entered else ''
+
+            writer.writerow([
+                invoice_id if invoice_id != 'NO_INVOICE' else '',
+                status,
+                r['consumer_name'], r['uci'], r['auth_number'], r['svc_code'], r['svc_subcode'],
+                r['service_month'], ', '.join(str(d) for d in r.get('service_days', [])),
+                r['days_entered'], r.get('expected_days', ''), unavailable_str, already_entered_str,
+                f'{inv_units:.2f}' if inv_units else '',
+                f'${inv_amount:.2f}' if inv_amount else '',
+                f'{rc_units:.2f}' if rc_units else '',
+                f'${rc_gross:.2f}' if rc_gross else '',
+                f'${rc_net:.2f}' if rc_net else '',
+                f'${rc_rate:.2f}' if rc_rate else '',
+                r['error']
+            ])
+
+        # Blank row between invoices
+        writer.writerow([])
+
     writer.writerow(['SUMMARY'])
     writer.writerow(['Time', user_results['timestamp']])
     writer.writerow(['Provider', user_results.get('provider_name', '')])
+    writer.writerow(['Total Invoices', len(sorted_invoice_ids)])
     writer.writerow(['Total Records', user_results['total_records']])
     writer.writerow(['Success', user_results['success_count']])
     writer.writerow(['Partial (some days unavailable)', user_results.get('partial_count', 0)])
@@ -326,6 +357,12 @@ def get_available_invoices():
             flash(w, 'warning')
 
         inventory = result['invoices']
+
+        # Sort by last name, then first name
+        inventory = sorted(inventory, key=lambda x: (
+            (x.get('last_name') or '').upper(),
+            (x.get('first_name') or '').upper()
+        ))
 
         # Store for download
         _last_available_invoices[current_user.id] = {
@@ -381,6 +418,12 @@ def get_available_invoices_ajax():
             return jsonify({'status': 'error', 'message': result['message']})
 
         inventory = result['invoices']
+
+        # Sort by last name, then first name
+        inventory = sorted(inventory, key=lambda x: (
+            (x.get('last_name') or '').upper(),
+            (x.get('first_name') or '').upper()
+        ))
 
         # Store for download
         _last_available_invoices[current_user.id] = {
@@ -438,6 +481,12 @@ def get_available_invoices_all():
 
         inventory = result['invoices']
         providers_scanned = result.get('providers_scanned', [])
+
+        # Sort by last name, then first name
+        inventory = sorted(inventory, key=lambda x: (
+            (x.get('last_name') or '').upper(),
+            (x.get('first_name') or '').upper()
+        ))
 
         # Store for download
         _last_available_invoices[current_user.id] = {
@@ -501,4 +550,307 @@ def download_available_invoices():
         output.getvalue(),
         mimetype='text/csv',
         headers={'Content-Disposition': f'attachment; filename=available_invoices_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'}
+    )
+
+
+# Store last FM submission results for download
+_last_fm_results = {}
+
+
+@main_bp.route('/submit-fm-invoice', methods=['POST'])
+@login_required
+def submit_fm_invoice():
+    """
+    Submit Filemaker invoice with capture-zero-enter workflow.
+
+    Expects JSON:
+    {
+        "claims": [...],  # FM invoice records
+        "provider_id": int
+    }
+
+    Returns JSON with FMUploadResult details.
+    """
+    global _last_fm_results
+
+    claims_data = request.json
+    records = claims_data.get('claims', [])
+    provider_id = claims_data.get('provider_id') or session.get('selected_provider_id')
+
+    if not records:
+        return jsonify({'status': 'error', 'message': 'No records to submit'})
+
+    if not provider_id:
+        return jsonify({'status': 'error', 'message': 'No provider selected'})
+
+    provider = Provider.query.get(provider_id)
+    if not provider or provider.user_id != current_user.id:
+        return jsonify({'status': 'error', 'message': 'Invalid provider'})
+
+    username, password = provider.get_credentials()
+    if not username or not password:
+        return jsonify({'status': 'error', 'message': f'No credentials for {provider.regional_center}. Go to Settings.'})
+
+    try:
+        results = submit_fm_invoice_fast(
+            records=records,
+            username=username,
+            password=password,
+            provider_name=None,
+            regional_center=provider.regional_center,
+            portal_url=provider.rc_portal_url
+        )
+
+        # Build result details for response
+        result_details = []
+        success_count = 0
+        partial_count = 0
+        failed_count = 0
+        skipped_count = 0
+
+        for r in results:
+            status = 'success' if r.success else 'failed'
+            if r.error_message and r.error_message.startswith('SKIPPED:'):
+                status = 'skipped'
+                skipped_count += 1
+            elif r.success:
+                success_count += 1
+            else:
+                failed_count += 1
+
+            # Format original values for display
+            original_str = ''
+            if r.original_values:
+                orig_days = [f"{d}:{v}" for d, v in sorted(r.original_values.items()) if v > 0]
+                original_str = ', '.join(orig_days) if orig_days else 'none'
+
+            result_details.append({
+                'status': status,
+                'last_name': r.last_name,
+                'first_name': r.first_name,
+                'uci': r.uci,
+                'invoice_id': r.invoice_id,
+                'service_month': r.service_month,
+                'svc_code': r.svc_code,
+                'svc_subcode': r.svc_subcode,
+                'auth_number': r.auth_number,
+                'fm_days': r.fm_service_days,
+                'original_values': original_str,
+                'original_total': r.original_total_units,
+                'days_zeroed': len(r.days_zeroed) if r.days_zeroed else 0,
+                'days_entered': len(r.days_entered) if r.days_entered else 0,
+                'days_unavailable': r.days_unavailable,
+                'final_total': r.final_total_units,
+                'final_gross': r.final_gross_amount,
+                'retry_count': r.retry_count,
+                'retry_reason': r.retry_reason,
+                'error': r.error_message
+            })
+
+        # Store for download
+        _last_fm_results[current_user.id] = {
+            'timestamp': datetime.now(),
+            'provider_name': provider.name,
+            'results': results
+        }
+
+        return jsonify({
+            'status': 'complete',
+            'message': f'Processed {len(results)} records: {success_count} success, {failed_count} failed, {skipped_count} skipped',
+            'results': result_details,
+            'summary': {
+                'total': len(results),
+                'success': success_count,
+                'failed': failed_count,
+                'skipped': skipped_count
+            }
+        })
+
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
+@main_bp.route('/zero-out-fm-entries', methods=['POST'])
+@login_required
+def zero_out_fm_entries():
+    """
+    Zero out entries for FM invoice records without entering new values.
+    This uses the same capture-zero workflow but skips entering FM values.
+    """
+    global _last_fm_results
+
+    claims_data = request.json
+    records = claims_data.get('claims', [])
+    provider_id = claims_data.get('provider_id') or session.get('selected_provider_id')
+
+    if not records:
+        return jsonify({'status': 'error', 'message': 'No records to zero out'})
+
+    if not provider_id:
+        return jsonify({'status': 'error', 'message': 'No provider selected'})
+
+    provider = Provider.query.get(provider_id)
+    if not provider or provider.user_id != current_user.id:
+        return jsonify({'status': 'error', 'message': 'Invalid provider'})
+
+    username, password = provider.get_credentials()
+    if not username or not password:
+        return jsonify({'status': 'error', 'message': f'No credentials for {provider.regional_center}. Go to Settings.'})
+
+    try:
+        results = submit_fm_invoice_fast(
+            records=records,
+            username=username,
+            password=password,
+            provider_name=None,
+            regional_center=provider.regional_center,
+            portal_url=provider.rc_portal_url,
+            zero_only=True  # Only zero out, don't enter new values
+        )
+
+        # Build result details for response
+        result_details = []
+        success_count = 0
+        failed_count = 0
+        skipped_count = 0
+
+        for r in results:
+            status = 'success' if r.success else 'failed'
+            if r.error_message and r.error_message.startswith('SKIPPED:'):
+                status = 'skipped'
+                skipped_count += 1
+            elif r.success:
+                success_count += 1
+            else:
+                failed_count += 1
+
+            # Format original values for display
+            original_str = ''
+            if r.original_values:
+                orig_days = [f"{d}:{v}" for d, v in sorted(r.original_values.items()) if v > 0]
+                original_str = ', '.join(orig_days) if orig_days else 'none'
+
+            result_details.append({
+                'status': status,
+                'last_name': r.last_name,
+                'first_name': r.first_name,
+                'uci': r.uci,
+                'invoice_id': r.invoice_id,
+                'service_month': r.service_month,
+                'svc_code': r.svc_code,
+                'original_values': original_str,
+                'original_total': r.original_total_units,
+                'days_zeroed': len(r.days_zeroed) if r.days_zeroed else 0,
+                'final_total': r.final_total_units,
+                'error': r.error_message
+            })
+
+        # Store for download
+        _last_fm_results[current_user.id] = {
+            'timestamp': datetime.now(),
+            'provider_name': provider.name,
+            'results': results
+        }
+
+        return jsonify({
+            'status': 'complete',
+            'message': f'Zeroed out {len(results)} records: {success_count} success, {failed_count} failed, {skipped_count} skipped',
+            'results': result_details,
+            'summary': {
+                'total': len(results),
+                'success': success_count,
+                'failed': failed_count,
+                'skipped': skipped_count
+            }
+        })
+
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)})
+
+
+@main_bp.route('/download-fm-report')
+@login_required
+def download_fm_report():
+    """Download the FM invoice submission results as a CSV file"""
+    global _last_fm_results
+
+    user_results = _last_fm_results.get(current_user.id)
+    if not user_results:
+        flash('No FM submission results to download', 'error')
+        return redirect(url_for('main.index'))
+
+    results = user_results['results']
+    provider_name = user_results['provider_name']
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Write header
+    writer.writerow([
+        'Status',
+        'Last Name',
+        'First Name',
+        'UCI',
+        'Invoice ID',
+        'Auth Number',
+        'SVC Code',
+        'SVC Subcode',
+        'Service Month',
+        'FM Days',
+        'Original Values',
+        'Original Total Units',
+        'Days Zeroed',
+        'Days Entered',
+        'Days Unavailable',
+        'Final Total Units',
+        'Final Gross Amount',
+        'Retry Count',
+        'Retry Reason',
+        'Error'
+    ])
+
+    # Write data rows
+    for r in results:
+        status = 'SUCCESS' if r.success else 'FAILED'
+        if r.error_message and r.error_message.startswith('SKIPPED:'):
+            status = 'SKIPPED'
+
+        # Format original values
+        original_str = ''
+        if r.original_values:
+            orig_days = [f"{d}:{v}" for d, v in sorted(r.original_values.items()) if v > 0]
+            original_str = '; '.join(orig_days) if orig_days else ''
+
+        # Format lists
+        fm_days_str = ','.join(map(str, r.fm_service_days)) if r.fm_service_days else ''
+        days_unavail_str = ','.join(map(str, r.days_unavailable)) if r.days_unavailable else ''
+
+        writer.writerow([
+            status,
+            r.last_name,
+            r.first_name,
+            r.uci,
+            r.invoice_id,
+            r.auth_number,
+            r.svc_code,
+            r.svc_subcode,
+            r.service_month,
+            fm_days_str,
+            original_str,
+            r.original_total_units,
+            len(r.days_zeroed) if r.days_zeroed else 0,
+            len(r.days_entered) if r.days_entered else 0,
+            days_unavail_str,
+            r.final_total_units,
+            r.final_gross_amount,
+            r.retry_count,
+            r.retry_reason or '',
+            r.error_message or ''
+        ])
+
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': f'attachment; filename=fm_submission_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'}
     )
